@@ -1,5 +1,5 @@
 # Runtime packages. numpy/soxr/websockets are also what the Linux tests need.
-numpy
+numpy==2.5.3
 soxr==1.1.0
 websockets==15.0.1
 onnxruntime

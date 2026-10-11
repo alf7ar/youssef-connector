@@ -443,8 +443,32 @@ def e2e(out: Path = None) -> int:
     return 1 if err else 0
 
 
+_crash_fh = None
+CRASH_KEEP = 200 * 1024
+
+
+def enable_crash_log(home: Path):
+    """faulthandler into <home>/crash.log (append, last ~200 KB kept, one timestamp header per run) so a native crash leaves
+    a Python stack. Never writes to sys.stderr (None under pythonw); never raises."""
+    global _crash_fh
+    try:
+        import faulthandler
+        home.mkdir(parents=True, exist_ok=True)
+        p = home / "crash.log"
+        if p.exists() and p.stat().st_size > CRASH_KEEP:
+            data = p.read_bytes()[-CRASH_KEEP:]
+            p.write_bytes(data)
+        _crash_fh = open(p, "a", encoding="utf-8")
+        _crash_fh.write(f"\n=== run {time.strftime('%Y-%m-%d %H:%M:%S')} pid {os.getpid()} ===\n")
+        _crash_fh.flush()
+        faulthandler.enable(file=_crash_fh, all_threads=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    enable_crash_log(app_home())
     out = Path(argv[argv.index("--selftest-out") + 1]) if "--selftest-out" in argv else None
     if "--version" in argv:
         print(read_version())

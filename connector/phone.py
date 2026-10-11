@@ -49,21 +49,35 @@ async def bt_radio(turn_on: bool = False) -> dict:
         return {"present": None, "on": None, "error": f"{type(e).__name__}: {e}"[:200]}
 
 
+_find_err = [None]
+
+
 async def find_iphone_mac() -> str:
-    """MAC of the first paired classic-Bluetooth device whose name contains "iPhone" ("" if none)."""
+    """MAC of a paired classic-Bluetooth device whose name contains "iPhone" ("" if none). Several iPhones may be paired:
+    the one that is CONNECTED now wins, else the first found. A failure is logged once (not swallowed)."""
     from winrt.windows.devices.enumeration import DeviceInformation
+    first = ""
     try:
         sel = BluetoothDevice.get_device_selector_from_pairing_state(True)
-        for di in await DeviceInformation.find_all_async(sel):
+        # pywinrt 3.x names the selector overload find_all_async_aqs_filter; older versions overload find_all_async
+        find = getattr(DeviceInformation, "find_all_async_aqs_filter", None) or DeviceInformation.find_all_async
+        for di in await find(sel):
             if "iphone" in (di.name or "").lower():
                 d = await BluetoothDevice.from_id_async(di.id)
                 if d is not None:
                     a = f"{d.bluetooth_address:012X}"
+                    connected = d.connection_status == BluetoothConnectionStatus.CONNECTED
                     d.close()
-                    return ":".join(a[i:i + 2] for i in range(0, 12, 2))
-    except Exception:  # noqa: BLE001
-        pass
-    return ""
+                    mac = ":".join(a[i:i + 2] for i in range(0, 12, 2))
+                    if connected:
+                        return mac
+                    first = first or mac
+    except Exception as e:  # noqa: BLE001
+        msg = f"{type(e).__name__}: {e}"[:200]
+        if _find_err[0] != msg:
+            _find_err[0] = msg
+            print("find_iphone_mac failed:", msg, flush=True)
+    return first
 
 
 async def iphone(mac: str) -> dict:

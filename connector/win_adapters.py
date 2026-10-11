@@ -128,6 +128,8 @@ class WinPhone(PhoneAdapter):
         self.ended = False
         self.devs = None        # (capture, render): MMDevice IDs (hf_direct) or PortAudio indices (cable)
         self.switched = False   # cable route: default devices were switched
+        self.last_states = None  # last phone_states tuple logged (change-only)
+        self.last_states_t = 0.0
 
     # ---- PhoneAdapter
     def ready(self) -> dict:
@@ -213,6 +215,18 @@ class WinPhone(PhoneAdapter):
             self.switched = False
             self._log("defaults_restored", ok=restore_defaults())
 
+    def _log_states(self, now, states, hf):
+        """Log one compact phone_states line when (live states, call_active, hf capture/render) changes (max ~1 per 0.4 s)."""
+        try:
+            key = (tuple(states), phone.call_flags().get("call_active"), hf.get("capture", {}).get("state"),
+                   hf.get("render", {}).get("state"))
+            if key != self.last_states and now - self.last_states_t >= 0.4:
+                self.last_states, self.last_states_t = key, now
+                self._log("phone_states", states=list(key[0]), call_active=key[1], hf_capture=key[2], hf_render=key[3],
+                          t=round(now - self.t_dial, 1))
+        except Exception:  # noqa: BLE001
+            pass
+
     def _before_audio(self, now: float) -> str:
         hf = phone.hf_endpoints()
         if all(hf.get(k, {}).get("state") == 1 for k in ("capture", "render")):
@@ -222,6 +236,7 @@ class WinPhone(PhoneAdapter):
         except Exception:  # noqa: BLE001
             states = []
         live = [x for x in states if x not in ("idle", "ambiguous")]
+        self._log_states(now, states, hf)
         self.seen = self.seen or bool(live)
         if (self.seen or now - self.t_dial > 5) and not live:
             self.gone_since = self.gone_since if self.gone_since is not None else now
@@ -230,6 +245,8 @@ class WinPhone(PhoneAdapter):
                 # it only ended if Windows says so too (call_active None = unknown: keep waiting)
                 flags = phone.call_flags()
                 if flags.get("call_active") is not True:
+                    self._log("call_ended", reason="phone_service_lists_no_live_call", states=states, **flags,
+                              hf={k: e.get("state") for k, e in hf.items()})
                     return self._end(None)   # ended (or never came up) before its audio reached the laptop
                 if not self.gap_logged:
                     self.gap_logged = True
@@ -368,6 +385,8 @@ class _Player:
 class WinAudio(AudioAdapter):
     """source()/player() are called by the core once the call is active, so the devices WinPhone chose are known."""
 
+    endpoint_volume = True   # config "endpoint_volume": false skips IdPlayer's max-volume step
+
     def __init__(self, phone_adapter: WinPhone, gain: float = 1.0, loudness: bool = True, log=None):
         self.phone, self.gain, self.loudness = phone_adapter, float(gain), loudness
         self.log = log or phone_adapter._log
@@ -401,6 +420,7 @@ class WinAudio(AudioAdapter):
         inner = win_audio.SdPlayer(ren) if self.phone.route == "cable" else win_audio.IdPlayer(ren)
         if hasattr(inner, "endpoint_id"):
             inner.on_event = self.log   # IdPlayer logs the endpoint volume it sets (endpoint_volume event)
+            inner.endpoint_volume = self.endpoint_volume
         self._opened()
         self.player_obj = _Player(inner, win_audio.Loudness() if self.loudness else None, self)
         return self.player_obj
@@ -441,5 +461,6 @@ def build(cfg: dict = None, log=None):
             cfg = {}
     ph, au, gate = make_adapters(cfg.get("audio_route") or "hf_direct", cfg.get("phone_mac") or "",
                                  cfg.get("in_gain", 1.0), cfg.get("loudness", True) is not False, log)
+    au.endpoint_volume = cfg.get("endpoint_volume", True) is not False
     ph.startup_cleanup()
     return ph, au, gate, ph.route

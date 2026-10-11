@@ -28,6 +28,8 @@ HF_SETTLE = 30.0    # s after app start / resume before the idle Hands-Free chec
 
 HF_REFRESH_EVERY = 900.0   # s between automatic Hands-Free refreshes (each takes ~2 min and needs an idle line)
 _last_hf_refresh = [0.0]
+RESCAN_EVERY = 30.0   # s between two iPhone re-scans while the cached phone is not connected
+_rescan_t = [-1e9]
 
 
 def resumed(prev: tuple | None, now: tuple, gap: float = RESUME_GAP) -> bool:
@@ -155,9 +157,17 @@ def auto_ready(info: dict, mac: str = "", log=_print_log) -> tuple:
     info["bt_radio"] = radio.get("on")
     if radio.get("on") is False:
         return False, "bluetooth_off"
+    cfg_mac = mac
     mac = mac or _mac[0] or asyncio.run(phone.find_iphone_mac())
     _mac[0] = mac or _mac[0]
     info["iphone_connected"] = asyncio.run(phone.iphone(mac)).get("connected")
+    if info["iphone_connected"] is False and not cfg_mac and time.monotonic() - _rescan_t[0] >= RESCAN_EVERY:
+        # the cached phone is not connected: another paired iPhone may be (at most one scan per RESCAN_EVERY s)
+        _rescan_t[0] = time.monotonic()
+        new = asyncio.run(phone.find_iphone_mac())
+        if new and new != mac:
+            mac = _mac[0] = new
+            info["iphone_connected"] = asyncio.run(phone.iphone(mac)).get("connected")
     if info["iphone_connected"] is False:
         return False, "iphone_not_connected"
     eps = phone.hf_endpoints()

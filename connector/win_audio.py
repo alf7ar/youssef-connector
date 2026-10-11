@@ -509,30 +509,33 @@ class IdPlayer(SdPlayer):
         self.stopped = False
         self.thread = None
         self.on_event = None   # callback(event, **kw) set by the engine, used for the endpoint_volume log line
+        self.endpoint_volume = True   # config "endpoint_volume": false skips the max-volume step
 
     def start(self):
         if self.thread is None:
             self.thread = threading.Thread(target=self._run, daemon=True, name="id-player")
             self.thread.start()
-            threading.Thread(target=self._max_endpoint_volume, daemon=True, name="id-volume").start()
+            if self.endpoint_volume:
+                threading.Thread(target=self._max_endpoint_volume, daemon=True, name="id-volume").start()
 
     def _max_endpoint_volume(self):
         """Each call: log the Hands-Free render endpoint's master volume + mute, then set 1.0 and unmute, so Windows' own
-        volume never makes Youssef quieter. Runs in its own thread, never raises, only logs."""
+        volume never makes Youssef quieter. Opens only this one endpoint by its MMDevice ID (micguard's helper and COM thread;
+        no device enumeration: pycaw GetAllDevices access-violated in the frozen exe). Never raises, only logs."""
         info = {"endpoint": str(self.endpoint_id)[-14:]}
         try:
-            _com_mta()   # this thread is fresh (started in start()); never the ctypes MTA join before the comtypes import
-            from pycaw.pycaw import AudioUtilities
-            want = str(self.endpoint_id).lower()
-            dev = next((d for d in AudioUtilities.GetAllDevices() if str(d.id).lower() == want), None)
-            if dev is None:
-                info["error"] = "endpoint not found"
-            else:
-                ev = dev.EndpointVolume
-                info["before_scalar"], info["before_mute"] = round(float(ev.GetMasterVolumeLevelScalar()), 2), bool(ev.GetMute())
+            from . import micguard
+            mics = micguard.WinMics()
+
+            def fn(comtypes):
+                ev = mics._ev(comtypes, mics._en(comtypes), self.endpoint_id)
+                out = {}
+                out["before_scalar"], out["before_mute"] = round(float(ev.GetMasterVolumeLevelScalar()), 2), bool(ev.GetMute())
                 ev.SetMasterVolumeLevelScalar(1.0, None)
                 ev.SetMute(0, None)
-                info["after_scalar"], info["after_mute"] = round(float(ev.GetMasterVolumeLevelScalar()), 2), bool(ev.GetMute())
+                out["after_scalar"], out["after_mute"] = round(float(ev.GetMasterVolumeLevelScalar()), 2), bool(ev.GetMute())
+                return out
+            info.update(micguard._com_thread(fn) or {"error": "no result"})
         except Exception as e:  # noqa: BLE001
             info["error"] = f"{type(e).__name__}: {e}"[:150]
         try:
