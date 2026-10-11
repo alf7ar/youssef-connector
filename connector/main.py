@@ -29,7 +29,7 @@ from pathlib import Path
 
 from . import guard, logsend, update
 
-MUTEX = "Global\\YoussefConnector"
+MUTEX = guard.MUTEX
 PORT = 5076
 UA = "YoussefConnector/1"
 
@@ -563,8 +563,6 @@ def main(argv=None) -> int:
     log = make_logger(home)
     version = read_version()
     app = App(home, version, log)
-    guard.record_start(home, version)
-    guard.start_heartbeat(home)
     rb = guard.rolled_back_info(home)
     if rb:
         log(f"update_rolled_back: {rb.get('from')} -> {rb.get('to')} (pinned; {rb.get('from')} is not offered again)")

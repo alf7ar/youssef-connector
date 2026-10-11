@@ -6,6 +6,9 @@ refresh never stalls the heartbeat).
 
 check() is what PhoneAdapter.ready() returns: {ok, reason, reason_ar, reason_en, warnings, bt_radio, iphone_connected,
 hfp_audio_device, phone_link_running, session_locked, call_active, hf_link, hf_state}. Blocking; call it from a worker thread.
+The warning probes (netsh, route, PowerShell: up to 15+15+20 s when Windows hangs) never run on that path: each runs in its own
+background thread, results are cached, and one check() waits at most PROBE_BUDGET s for them (a late result shows up in the next
+heartbeat; a result older than PROBE_MAX_AGE counts as unknown), so they cannot push a heartbeat past the hub's 30 s timeout.
 `warnings` is a list of {code, ar, en}: things that do not stop the next call (ok stays True) but hurt it
 (iphone_hotspot_internet, old_app_running); `reason_ar`/`reason_en` are the texts of `reason` ("" when ready)."""
 import asyncio
@@ -68,7 +71,11 @@ OLD_APP_TASKS = ("AhmedDialerApp", "AhmedDialerOpenOnUnlock")
 # the iPhone Personal Hotspot subnet (prefix 172.20.10 /28), built from numbers: the public-repo gate rejects dotted IPv4 literals
 HOTSPOT_NET = ipaddress.IPv4Network(((172 << 24) | (20 << 16) | (10 << 8), 28))
 NET_TTL, OLD_APP_TTL = 10.0, 30.0   # s a network / old-app probe result is reused (heartbeat every 10 s; the old-app probe starts PowerShell)
+PROBE_BUDGET = 4.0                   # s one check() waits for the warning probes at most (heartbeat every 10 s, hub timeout 30 s)
+PROBE_MAX_AGE = 120.0                # s a cached probe result stays usable when its refresh hangs; older = unknown (None)
 _cache = {}                          # key -> (monotonic time, value)
+_inflight = {}                       # key -> running probe thread
+_probe_lock = threading.Lock()
 _phone_name = [""]                   # Bluetooth name of the paired iPhone last seen (the Personal Hotspot SSID defaults to it)
 
 
@@ -151,14 +158,34 @@ def _run(cmd: list, timeout: float = 15.0):
         return None
 
 
-def _cached(key: str, ttl: float, fn):
+def _kick(key: str, fn):
+    """Run fn() in a daemon thread and cache its value, unless a probe for `key` is already running."""
+    def run():
+        try:
+            val = fn()
+        except Exception:  # noqa: BLE001
+            return
+        _cache[key] = (time.monotonic(), val)
+    with _probe_lock:
+        t = _inflight.get(key)
+        if t is not None and t.is_alive():
+            return
+        t = _inflight[key] = threading.Thread(target=run, daemon=True, name="probe-" + key)
+        t.start()
+
+
+def _cached(key: str, ttl: float, fn, deadline: float = None):
+    """Value of probe `key`: the cache while it is younger than `ttl`; else a background refresh is started and waited for until
+    `deadline` (monotonic; default now + PROBE_BUDGET), then the cache is used if it is younger than PROBE_MAX_AGE, else None."""
     now = time.monotonic()
     hit = _cache.get(key)
-    if hit and now - hit[0] < ttl:
-        return hit[1]
-    val = fn()
-    _cache[key] = (now, val)
-    return val
+    if not (hit and now - hit[0] < ttl):
+        _kick(key, fn)
+        t = _inflight.get(key)
+        if t is not None:
+            t.join(max(0.0, (now + PROBE_BUDGET if deadline is None else deadline) - time.monotonic()))
+        hit = _cache.get(key)
+    return hit[1] if hit and time.monotonic() - hit[0] < PROBE_MAX_AGE else None
 
 
 def parse_ssid(out):
@@ -208,11 +235,19 @@ def _norm_name(s) -> str:
     return " ".join(str(s or "").replace("\u2019", "'").replace("\u2018", "'").split()).casefold()
 
 
-def hotspot_internet(phone_name: str = ""):
+def _ssid_probe():
+    return parse_ssid(_run(["netsh", "wlan", "show", "interfaces"]))
+
+
+def _gw_probe():
+    return parse_gateways(_run(["route", "print", "-4"]))
+
+
+def hotspot_internet(phone_name: str = "", deadline: float = None):
     """True when the laptop's internet comes through the paired iPhone's own Personal Hotspot: the connected Wi-Fi SSID equals
     the iPhone's name, or a default gateway is inside the hotspot subnet. False when neither; None when nothing could be read."""
-    ssid = _cached("ssid", NET_TTL, lambda: parse_ssid(_run(["netsh", "wlan", "show", "interfaces"])))
-    gws = _cached("gw", NET_TTL, lambda: parse_gateways(_run(["route", "print", "-4"])))
+    ssid = _cached("ssid", NET_TTL, _ssid_probe, deadline)
+    gws = _cached("gw", NET_TTL, _gw_probe, deadline)
     if ssid and phone_name and _norm_name(ssid) == _norm_name(phone_name):
         return True
     if any(ipaddress.IPv4Address(g) in HOTSPOT_NET for g in gws or ()):
@@ -231,17 +266,24 @@ def _old_app_probe():
     return parse_old_app(_run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=20))
 
 
-def old_app_running():
+def old_app_running(deadline: float = None):
     """True when the old AhmedDialer app (a process under AhmedDialer, or its scheduled task AhmedDialerApp /
     AhmedDialerOpenOnUnlock in state Running) is up; None when that cannot be told (not Windows)."""
-    found = _cached("old_app", OLD_APP_TTL, _old_app_probe)
+    found = _cached("old_app", OLD_APP_TTL, _old_app_probe, deadline)
     return None if found is None else bool(found)
 
 
 def collect_warnings(phone_name: str = "") -> list:
-    """The warnings that apply now, as [{code, ar, en}]. A probe that fails adds nothing."""
+    """The warnings that apply now, as [{code, ar, en}]. A probe that fails, is unreadable or is still running after
+    PROBE_BUDGET s adds nothing (its last result, if recent, is used)."""
+    deadline = time.monotonic() + PROBE_BUDGET
+    for key, ttl, fn in (("ssid", NET_TTL, _ssid_probe), ("gw", NET_TTL, _gw_probe), ("old_app", OLD_APP_TTL, _old_app_probe)):
+        hit = _cache.get(key)
+        if not (hit and time.monotonic() - hit[0] < ttl):
+            _kick(key, fn)     # start all stale probes first: they run side by side inside one budget
     out = []
-    for code, probe in (("iphone_hotspot_internet", lambda: hotspot_internet(phone_name)), ("old_app_running", old_app_running)):
+    for code, probe in (("iphone_hotspot_internet", lambda: hotspot_internet(phone_name, deadline)),
+                        ("old_app_running", lambda: old_app_running(deadline))):
         try:
             if probe() is True:
                 out.append(warning(code))

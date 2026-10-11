@@ -3,6 +3,8 @@ Windows tools (netsh, route, PowerShell) are replaced by canned output through r
 (the public-repo gate rejects them), addresses are built with ip()."""
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -44,9 +46,11 @@ class Fake:
 @pytest.fixture(autouse=True)
 def clean(monkeypatch):
     readiness._cache.clear()
+    readiness._inflight.clear()
     monkeypatch.setattr(readiness, "_phone_name", [""])
     yield
     readiness._cache.clear()
+    readiness._inflight.clear()
 
 
 def use(monkeypatch, **out):
@@ -257,3 +261,75 @@ def test_winphone_call_active_shortcut_has_texts():
     w.t_dial, w.ended, w.mac, w.log = 1.0, False, "", None
     r = w.ready()
     assert r["ok"] is False and r["reason"] == "call_active" and r["reason_ar"] and r["warnings"] == []
+
+
+# ---------------------------------------------------------------- probes stay off the heartbeat path (0.1.2-rc2)
+class Hung:
+    """_run stand-in whose commands block until released (netsh/route/PowerShell hanging) and then answer with `out`."""
+    def __init__(self, **out):
+        self.out, self.release, self.started = out, threading.Event(), []
+
+    def __call__(self, cmd, timeout=15.0):
+        self.started.append(cmd[0])
+        self.release.wait(30)
+        return self.out.get(cmd[0])
+
+
+def join_probes():
+    for t in list(readiness._inflight.values()):
+        t.join(5)
+
+
+def test_hung_probes_do_not_stall_check(monkeypatch):
+    setup_ready(monkeypatch)
+    monkeypatch.setattr(readiness, "PROBE_BUDGET", 0.4)
+    h = Hung(netsh=netsh("Tester's iPhone"), route=route(ip(172, 20, 10, 1)), powershell=ps("P|7|pythonw.exe"))
+    monkeypatch.setattr(readiness, "_run", h)
+    t0 = time.monotonic()
+    r = readiness.check("", lambda *a, **k: None)
+    took = time.monotonic() - t0
+    assert took < 1.5, took                                   # three hung commands cost one budget, not 15+15+20 s
+    assert sorted(h.started) == ["netsh", "powershell", "route"]   # all three ran side by side
+    assert r["ok"] is True and r["reason"] == "" and r["warnings"] == []   # nothing known yet: no warning, same ok/reason
+    h.release.set()
+    join_probes()
+    t0 = time.monotonic()
+    r = readiness.check("", lambda *a, **k: None)             # the late results are used by the next heartbeat
+    assert time.monotonic() - t0 < 0.5
+    assert codes(r["warnings"]) == ["iphone_hotspot_internet", "old_app_running"]
+    assert r["warnings"][0] == readiness.warning("iphone_hotspot_internet") and r["reason_ar"] == r["reason_en"] == ""
+
+
+def test_probes_refresh_in_background_and_last_result_is_kept(monkeypatch):
+    use(monkeypatch, netsh=netsh("Home"), route=route(ip(172, 20, 10, 1)), powershell="")
+    assert codes(readiness.collect_warnings("")) == ["iphone_hotspot_internet"]
+    monkeypatch.setattr(readiness, "NET_TTL", 0.0)            # expired: refresh needed
+    monkeypatch.setattr(readiness, "PROBE_BUDGET", 0.2)
+    h = Hung(netsh=netsh("Home"), route=route(ip(192, 168, 1, 1)), powershell="")
+    monkeypatch.setattr(readiness, "_run", h)
+    t0 = time.monotonic()
+    assert codes(readiness.collect_warnings("")) == ["iphone_hotspot_internet"]   # refresh hangs: last result still counts
+    assert time.monotonic() - t0 < 1.0
+    h.release.set()
+    join_probes()
+    assert readiness.collect_warnings("") == []                # the refresh landed
+
+
+def test_probe_result_older_than_max_age_is_unknown(monkeypatch):
+    use(monkeypatch, netsh=netsh("Home"), route=route(ip(172, 20, 10, 1)))
+    assert readiness.hotspot_internet("") is True
+    monkeypatch.setattr(readiness, "NET_TTL", 0.0)
+    monkeypatch.setattr(readiness, "PROBE_MAX_AGE", 0.0)
+    monkeypatch.setattr(readiness, "PROBE_BUDGET", 0.1)
+    h = Hung()
+    monkeypatch.setattr(readiness, "_run", h)
+    assert readiness.hotspot_internet("") is None             # stale and the refresh hangs: unknown, not a stale True
+    h.release.set()
+    join_probes()
+
+
+def test_probe_that_raises_adds_nothing(monkeypatch):
+    def boom(cmd, timeout=15.0):
+        raise RuntimeError("x")
+    monkeypatch.setattr(readiness, "_run", boom)
+    assert readiness.collect_warnings("") == []

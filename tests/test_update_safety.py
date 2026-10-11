@@ -142,8 +142,8 @@ def test_one_fast_death_or_long_run_or_clean_exit_does_not_roll_back(tmp_path):
     make_backup(home)
     guard.record_start(home, "0.1.2", 1000.0)
     guard._write(home / "guard.json", {**guard._read(home / "guard.json"), "alive": 1010.0})
-    guard.record_start(home, "0.1.2", 1100.0)                       # 1 fast death so far
-    assert not guard.rollback_due(home, "0.1.2", 1100.0)
+    assert not guard.rollback_due(home, "0.1.2", 1100.0)            # 1 fast death so far
+    guard.record_start(home, "0.1.2", 1100.0)
     guard._write(home / "guard.json", {**guard._read(home / "guard.json"), "alive": 1100.0 + 300})   # lived 300 s
     assert not guard.rollback_due(home, "0.1.2", 2000.0)
     guard.record_start(home, "0.1.2", 2000.0)
@@ -155,8 +155,9 @@ def test_running_instance_is_not_a_death(tmp_path):
     home = tmp_path / "home"
     make_backup(home)
     guard.record_start(home, "0.1.2", 1000.0)
-    guard._write(home / "guard.json", {**guard._read(home / "guard.json"), "fd": 1})
-    assert guard.pending_deaths(guard._read(home / "guard.json"), "0.1.2", 1005.0) == 0   # heartbeat fresh
+    before = guard._read(home / "guard.json")
+    assert guard.begin(home, "0.1.2", running=True, can_rollback=True, now=1005.0) == "other"   # mutex held: nothing recorded
+    assert guard._read(home / "guard.json") == before
 
 
 def test_no_rollback_without_a_different_backup(tmp_path):

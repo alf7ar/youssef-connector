@@ -1,5 +1,6 @@
 """PyInstaller entry point (keeps the `connector` package imports relative).
-The crash-loop check runs first and imports only the stdlib-only guard, so a build that cannot even import is still rolled back."""
+The crash-loop guard runs first and imports only the stdlib-only guard: it records this start (and starts its heartbeat) BEFORE
+`connector.main` is imported, so a build that cannot even import still counts its starts and is rolled back after two."""
 import os
 import sys
 
@@ -11,7 +12,7 @@ if __name__ == "__main__":
             from connector import guard
             home = Path(os.environ.get("YC_HOME") or (os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")) + "\\YoussefConnector")
             ver = (Path(getattr(sys, "_MEIPASS", ".")) / "VERSION").read_text(encoding="utf-8").strip()
-            if guard.frozen() and guard.rollback_due(home, ver) and guard.rollback(home, ver):
+            if guard.begin(home, ver) == "rollback":
                 sys.exit(0)
         except Exception:  # noqa: BLE001  (the guard must never block a start)
             pass

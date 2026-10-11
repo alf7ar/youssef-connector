@@ -47,7 +47,8 @@ _ABORT = object()
 
 
 def _vtuple(v: str):
-    return tuple(int(p) if p.isdigit() else 0 for p in str(v).split("."))
+    from .update import version_key   # a pre-release suffix counts: 0.1.2-rc1 is newer than 0.1.1 and older than 0.1.2
+    return version_key(v)
 
 
 def level_summary(levels) -> dict:
