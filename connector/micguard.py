@@ -15,8 +15,36 @@ STATE = HOME / "mic-mute.json"
 ROLES = (0, 2)   # eConsole, eCommunications
 
 
+_mta_keeper = []
+
+
+def _keep_mta_alive():
+    """One daemon thread that joins the MTA and never leaves, so the MTA (and every comtypes object created in it) outlives
+    the short-lived COM threads. Without it, a COM wrapper left for the garbage collector was Released after its apartment
+    was gone: access violation in _ctypes (live test 2026-10-11, GC ran inside the soundcard import on the audio thread)."""
+    if _mta_keeper:
+        return
+    ready = threading.Event()
+
+    def run():
+        try:
+            sys.coinit_flags = 0
+            import comtypes
+            comtypes.CoInitializeEx(0)
+        except Exception:  # noqa: BLE001  (no comtypes: tests / non-Windows)
+            return
+        finally:
+            ready.set()
+        threading.Event().wait()
+    t = threading.Thread(target=run, daemon=True, name="mta-keeper")
+    _mta_keeper.append(t)
+    t.start()
+    ready.wait(10)
+
+
 def _com_thread(fn):
     box = {}
+    _keep_mta_alive()
 
     def run():
         try:
@@ -26,6 +54,9 @@ def _com_thread(fn):
             box["r"] = fn(comtypes)
         except Exception as e:  # noqa: BLE001
             box["e"] = e
+        finally:
+            import gc
+            gc.collect()   # release this thread's COM wrappers here, while it is still in the apartment
     t = threading.Thread(target=run, daemon=True, name="micguard-com")
     t.start()
     t.join(15)

@@ -320,12 +320,27 @@ class Connector:
             elif st == "active":
                 call.active.set()
             elif st == "ended":
+                si = getattr(call.source, "inner", call.source) if call.source is not None else None
+                lv = list(getattr(si, "levels", []) or [])
+                self.log("call end: answered", call.answered_at is not None, "source_error", repr(getattr(si, "error", None)),
+                         "frames", len(lv), "max_dbfs", max(lv) if lv else None, "last", lv[-8:])
                 call.finish(self._end_reason(call, now))
                 return
             if call.answered_at is None and now - t0 > DIAL_WINDOW:
                 call.finish("no_answer")
                 return
+            if call.source is not None and call.answered_at is None and not call.source.alive() and not getattr(call, "_dead_logged", False):
+                call._dead_logged = True
+                si = getattr(call.source, "inner", call.source)
+                self.log("audio source died before answer:", repr(getattr(si, "error", None)),
+                         "levels", list(getattr(si, "levels", []))[-10:])
             if call.source is not None and call.answered_at is not None and not call.source.alive():
+                src_in = getattr(call.source, "inner", call.source)
+                pl_in = getattr(getattr(call.player, "inner", None), "inner", None) or getattr(call.player, "inner", call.player)
+                self.log("audio source stopped: source", repr(getattr(src_in, "error", None)),
+                         "alive", getattr(getattr(src_in, "thread", None), "is_alive", lambda: None)(),
+                         "player", repr(getattr(pl_in, "error", None)),
+                         "alive", getattr(getattr(pl_in, "thread", None), "is_alive", lambda: None)())
                 call.finish("audio_error")
                 return
             await self.clock.sleep(POLL)
