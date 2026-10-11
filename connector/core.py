@@ -50,6 +50,15 @@ def _vtuple(v: str):
     return tuple(int(p) if p.isdigit() else 0 for p in str(v).split("."))
 
 
+def level_summary(levels) -> dict:
+    """Capture level summary from the per-20 ms-frame RMS dBFS list: how many frames carried sound (above -60 dBFS), and the median / 90th
+    percentile / loudest of those. A mean over all frames is dragged down by the silent ones and says nothing about the speech level."""
+    act = sorted(v for v in levels if v > -60.0)
+    if not act:
+        return {"active_frames": 0}
+    return {"active_frames": len(act), "p50": act[len(act) // 2], "p90": act[min(len(act) - 1, int(len(act) * 0.9))], "max": act[-1]}
+
+
 class Clock:
     """Injectable time: speed>1 makes sleeps shorter and now() run faster (tests)."""
     def __init__(self, speed: float = 1.0):
@@ -338,7 +347,7 @@ class Connector:
                 si = getattr(call.source, "inner", call.source) if call.source is not None else None
                 lv = list(getattr(si, "levels", []) or [])
                 self.log("call end: answered", call.answered_at is not None, "source_error", repr(getattr(si, "error", None)),
-                         "frames", len(lv), "max_dbfs", max(lv) if lv else None, "last", lv[-8:])
+                         "frames", len(lv), "max_dbfs", max(lv) if lv else None, "last", lv[-8:], "speech", level_summary(lv))
                 call.finish(self._end_reason(call, now))
                 return
             if call.answered_at is None and now - t0 > DIAL_WINDOW:

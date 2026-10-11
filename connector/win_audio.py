@@ -465,10 +465,39 @@ class IdSource:
         self.stopped = False
         self.started = False
         self.thread = None
+        self.on_event = None   # callback(event, **kw) set by the engine, used for the capture_volume log line
+        self.capture_volume = "off"   # config "capture_volume": "off" | "log" (read the Hands-Free mic endpoint volume) | "max" (log, then set 1.0)
 
     def start(self, cb):
         self.thread = threading.Thread(target=self._run, args=(cb,), daemon=True, name="id-source")
         self.thread.start()
+        if self.capture_volume in ("log", "max"):
+            threading.Thread(target=self._capture_volume, daemon=True, name="id-capvol").start()
+
+    def _capture_volume(self):
+        """Opt-in (config capture_volume): log the Hands-Free CAPTURE endpoint's master volume + mute and, in "max" mode, set the volume to
+        1.0, so a low Windows microphone level never makes the callee quieter before the server hears it (the render side is already
+        maxed by IdPlayer). Same one-endpoint-by-ID COM path as IdPlayer; never raises, only logs. The mute state is only reported."""
+        info = {"endpoint": str(self.endpoint_id)[-14:], "mode": self.capture_volume}
+        try:
+            from . import micguard
+            mics = micguard.WinMics()
+
+            def fn(comtypes):
+                ev = mics._ev(comtypes, mics._en(comtypes), self.endpoint_id)
+                out = {"before_scalar": round(float(ev.GetMasterVolumeLevelScalar()), 2), "mute": bool(ev.GetMute())}
+                if self.capture_volume == "max":
+                    ev.SetMasterVolumeLevelScalar(1.0, None)
+                    out["after_scalar"] = round(float(ev.GetMasterVolumeLevelScalar()), 2)
+                return out
+            info.update(micguard._com_thread(fn) or {"error": "no result"})
+        except Exception as e:  # noqa: BLE001
+            info["error"] = f"{type(e).__name__}: {e}"[:150]
+        try:
+            if self.on_event:
+                self.on_event("capture_volume", **info)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _run(self, cb):
         try:

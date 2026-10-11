@@ -386,6 +386,7 @@ class WinAudio(AudioAdapter):
     """source()/player() are called by the core once the call is active, so the devices WinPhone chose are known."""
 
     endpoint_volume = True   # config "endpoint_volume": false skips IdPlayer's max-volume step
+    capture_volume = "off"   # config "capture_volume": "off" | "log" | "max": IdSource's Hands-Free microphone endpoint volume
 
     def __init__(self, phone_adapter: WinPhone, gain: float = 1.0, loudness: bool = True, log=None):
         self.phone, self.gain, self.loudness = phone_adapter, float(gain), loudness
@@ -412,6 +413,9 @@ class WinAudio(AudioAdapter):
         cap = self._devs()[0]
         inner = (win_audio.SdSource(cap, gain=self.gain) if self.phone.route == "cable"
                  else win_audio.IdSource(cap, gain=self.gain))
+        if hasattr(inner, "endpoint_id"):
+            inner.on_event = self.log   # IdSource logs the capture endpoint volume (capture_volume event) when the config asks
+            inner.capture_volume = self.capture_volume
         self._opened()
         return _Source(inner, self)
 
@@ -462,5 +466,6 @@ def build(cfg: dict = None, log=None):
     ph, au, gate = make_adapters(cfg.get("audio_route") or "hf_direct", cfg.get("phone_mac") or "",
                                  cfg.get("in_gain", 1.0), cfg.get("loudness", True) is not False, log)
     au.endpoint_volume = cfg.get("endpoint_volume", True) is not False
+    au.capture_volume = cfg.get("capture_volume") if cfg.get("capture_volume") in ("log", "max") else "off"
     ph.startup_cleanup()
     return ph, au, gate, ph.route
