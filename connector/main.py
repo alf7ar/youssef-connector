@@ -378,16 +378,23 @@ SELFTEST_LIMIT_S = 55
 
 def selftest(out: Path = None) -> int:
     lines, ok = [], True
+    fh = open(out, "w", encoding="utf-8", buffering=1) if out else None   # line-buffered: a hang still leaves the steps done so far
+
+    def emit(line):
+        lines.append(line)
+        if fh:
+            fh.write(line + "\n")
 
     def step(name, fn):
         nonlocal ok
         try:
+            emit(f"START {name}")
             r = fn()
-            lines.append(f"PASS {name}" + (f": {r}" if r else ""))
+            emit(f"PASS {name}" + (f": {r}" if r else ""))
         except Exception as e:  # noqa: BLE001
             ok = False
-            lines.append(f"FAIL {name}: {type(e).__name__}: {e}")
-            lines.append(traceback.format_exc(limit=4))
+            emit(f"FAIL {name}: {type(e).__name__}: {e}")
+            emit(traceback.format_exc(limit=4))
 
     def imports():
         import numpy, onnxruntime, soxr, websockets  # noqa: F401,E401
@@ -424,7 +431,8 @@ def selftest(out: Path = None) -> int:
         return f"ended={reason}"
 
     import faulthandler
-    faulthandler.dump_traceback_later(SELFTEST_LIMIT_S, exit=True)   # a hang dumps every thread's stack and exits non-zero
+    with contextlib.suppress(Exception):   # no --selftest-out and no stderr (windowed exe): no watchdog
+        faulthandler.dump_traceback_later(SELFTEST_LIMIT_S, exit=True, file=fh or sys.stderr)   # a hang dumps every thread's stack, exit 1
     t0 = time.time()
     step("imports", imports)
     step("crash-log", crash_log)
@@ -433,11 +441,10 @@ def selftest(out: Path = None) -> int:
     step("vad-model", _check_vad)
     step("fake-audio-loop", fake_loop)
     faulthandler.cancel_dump_traceback_later()
-    lines.append("SELFTEST " + ("OK" if ok else "FAILED") + f" in {time.time() - t0:.1f}s")
-    text = "\n".join(lines)
-    print(text, flush=True)
-    if out:
-        Path(out).write_text(text + "\n", encoding="utf-8")
+    emit("SELFTEST " + ("OK" if ok else "FAILED") + f" in {time.time() - t0:.1f}s")
+    if fh:
+        fh.close()
+    print("\n".join(l for l in lines if not l.startswith("START ")), flush=True)
     return 0 if ok else 1
 
 
