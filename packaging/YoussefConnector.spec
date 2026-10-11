@@ -9,7 +9,7 @@ ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 PKG = os.path.join(ROOT, "connector")
 
 datas, binaries, hiddenimports = [], [], []
-for pkg in ("onnxruntime", "soundcard", "sounddevice", "soxr", "pycaw"):
+for pkg in ("soundcard", "sounddevice", "soxr", "pycaw"):
     try:
         d, b, h = collect_all(pkg)
         datas += d
@@ -21,7 +21,7 @@ hiddenimports += ["winrt.windows.applicationmodel.calls", "winrt.windows.devices
                   "winrt.windows.devices.enumeration", "comtypes.client", "pycaw.pycaw", "pycaw.api.mmdeviceapi",
                   "pycaw.constants", "soundcard.mediafoundation"]
 hiddenimports += collect_submodules("winrt") + collect_submodules("websockets") + ["comtypes", "psutil", "mock_hub"]
-hiddenimports += collect_submodules("connector")
+hiddenimports += collect_submodules("connector") + ["onnxruntime"]   # PyInstaller ships a hook for it; collect_all crashes on onnxruntime.quantization
 
 # files read from disk at runtime: the VAD model + PowerShell dial helper (next to their modules), VERSION, the mock hub (--selftest)
 for pattern in ("*.onnx", "*.ps1"):
