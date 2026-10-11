@@ -1,6 +1,7 @@
 """App glue: connect code, /connector/ping check, status page + /connect, and the full fake e2e (no devices, no network)."""
 import base64
 import json
+import os
 import sys
 import threading
 import urllib.request
@@ -93,16 +94,15 @@ def test_e2e_fake_adapters(tmp_path, monkeypatch, capsys):
     assert "E2E OK ended=agent_end" in out.read_text()
 
 
-def test_selftest_runs_clean(tmp_path, monkeypatch):
-    monkeypatch.setenv("YC_HOME", str(tmp_path))
+def test_selftest_runs_clean(tmp_path):
+    """In its own process: on Windows --selftest imports the real winrt/COM modules, which other tests stub in sys.modules."""
+    import subprocess
     out = tmp_path / "selftest.txt"
-    try:
-        assert cm.main(["--selftest", "--selftest-out", str(out)]) == 0
-    finally:
-        import faulthandler
-        faulthandler.disable()
-        cm._crash_fh.close()
+    root = Path(__file__).resolve().parents[1]
+    p = subprocess.run([sys.executable, "-m", "connector.main", "--selftest", "--selftest-out", str(out)], cwd=root, timeout=90,
+                       env={**os.environ, "YC_HOME": str(tmp_path)}, capture_output=True, text=True)
     text = out.read_text()
+    assert p.returncode == 0, (p.returncode, text, p.stderr[-1500:])
     for step in ("imports", "crash-log", "com-init", "vad-model", "fake-audio-loop"):
         assert f"PASS {step}" in text, text
-    assert "SELFTEST OK" in text
+    assert "SELFTEST OK in" in text
