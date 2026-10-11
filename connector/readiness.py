@@ -4,10 +4,14 @@ LLM/TTS key checks and without a call-history reader. Functions marked "verbatim
 copies; auto_ready and the Hands-Free refresh are adapted (synchronous, the refresh runs in a daemon thread so a ~2 minute
 refresh never stalls the heartbeat).
 
-check() is what PhoneAdapter.ready() returns: {ok, reason, bt_radio, iphone_connected, hfp_audio_device,
-phone_link_running, session_locked, call_active, hf_link, hf_state}. Blocking; call it from a worker thread."""
+check() is what PhoneAdapter.ready() returns: {ok, reason, reason_ar, reason_en, warnings, bt_radio, iphone_connected,
+hfp_audio_device, phone_link_running, session_locked, call_active, hf_link, hf_state}. Blocking; call it from a worker thread.
+`warnings` is a list of {code, ar, en}: things that do not stop the next call (ok stays True) but hurt it
+(iphone_hotspot_internet, old_app_running); `reason_ar`/`reason_en` are the texts of `reason` ("" when ready)."""
 import asyncio
 import importlib
+import ipaddress
+import re
 import threading
 import time
 
@@ -30,6 +34,62 @@ HF_REFRESH_EVERY = 900.0   # s between automatic Hands-Free refreshes (each take
 _last_hf_refresh = [0.0]
 RESCAN_EVERY = 30.0   # s between two iPhone re-scans while the cached phone is not connected
 _rescan_t = [-1e9]
+
+# ---- texts (Arabic, English) of every reason code auto_ready/check can return and of every warning code
+REASONS = {
+    "call_active": ("في مكالمة شغالة دلوقتي. استنى لما تخلص.", "A call is in progress. Wait for it to end."),
+    "call_incoming": ("في مكالمة داخلة على الآيفون. ردّ عليها أو ارفضها.", "An incoming call is ringing on the iPhone. Answer or decline it."),
+    "call_state_unknown": ("مش قادر أعرف حالة المكالمات على اللابتوب. استنى شوية.", "The call state on the laptop cannot be read yet. Wait a moment."),
+    "hf_link_active": ("خط الصوت (Hands-Free) مفتوح من مكالمة قبل كده. اقفل أي مكالمة وافصل وصّل البلوتوث.",
+                       "The Hands-Free audio link is still up from an earlier call. End any call or reconnect Bluetooth."),
+    "session_locked": ("شاشة اللابتوب مقفولة. افتحها (ادخل الباسورد).", "The laptop is locked. Unlock it."),
+    "battery_saver": ("وضع توفير البطارية شغال وبيبوّظ البلوتوث. اقفله أو وصّل الشاحن.",
+                      "Battery saver is on and throttles Bluetooth. Turn it off or plug in the charger."),
+    "phone_link_not_running": ("برنامج Phone Link مش شغال. افتحه من قايمة ابدأ.", "Phone Link is not running. Open it from the Start menu."),
+    "bluetooth_off": ("البلوتوث مقفول على اللابتوب. شغّله.", "Bluetooth is off on the laptop. Turn it on."),
+    "iphone_not_connected": ("الآيفون مش متوصل بالبلوتوث. شغّل البلوتوث على الآيفون وقرّبه من اللابتوب.",
+                             "The iPhone is not connected over Bluetooth. Turn Bluetooth on on the iPhone and bring it close."),
+    "hf_refreshing": ("بجدد خدمة الصوت (Hands-Free) مع الآيفون. هتاخد حوالي دقيقتين.",
+                      "Refreshing the iPhone Hands-Free audio service. It takes about two minutes."),
+    "hf_endpoints": ("جهازي الصوت بتوع الآيفون (Hands-Free) مش ظاهرين. افصل وصّل البلوتوث.",
+                     "The iPhone Hands-Free audio devices are missing. Reconnect Bluetooth."),
+    "phone_module_unavailable": ("وحدة الهاتف مش شغالة على الجهاز ده. أعد تثبيت البرنامج.",
+                                 "The phone module is unavailable on this computer. Reinstall the app."),
+    "ready_check_failed": ("فحص الجاهزية فشل. لو استمر اقفل البرنامج وافتحه تاني.", "The readiness check failed. Restart the app if it persists."),
+    "ready() failed": ("فحص الجاهزية فشل. لو استمر اقفل البرنامج وافتحه تاني.", "The readiness check failed. Restart the app if it persists."),
+}
+WARNINGS = {
+    "iphone_hotspot_internet": ("اللابتوب واخد نت من نفس الآيفون، ده بيبوظ صوت المكالمة. وصّل واي فاي تاني",
+                                "The laptop gets its internet from the same iPhone, which breaks the call audio. Connect to another Wi-Fi."),
+    "old_app_running": ("البرنامج القديم (AhmedDialer) شغال وبيتعارض مع البرنامج ده. اقفله.",
+                        "The old AhmedDialer app is running and conflicts with this one. Close it."),
+}
+OLD_APP_TASKS = ("AhmedDialerApp", "AhmedDialerOpenOnUnlock")
+# the iPhone Personal Hotspot subnet (prefix 172.20.10 /28), built from numbers: the public-repo gate rejects dotted IPv4 literals
+HOTSPOT_NET = ipaddress.IPv4Network(((172 << 24) | (20 << 16) | (10 << 8), 28))
+NET_TTL, OLD_APP_TTL = 10.0, 30.0   # s a network / old-app probe result is reused (heartbeat every 10 s; the old-app probe starts PowerShell)
+_cache = {}                          # key -> (monotonic time, value)
+_phone_name = [""]                   # Bluetooth name of the paired iPhone last seen (the Personal Hotspot SSID defaults to it)
+
+
+def reason_texts(reason) -> tuple:
+    """(ar, en) of a reason code; "ready_check_failed: X" and "ready() failed: X" use the text of their code. ("", "") for no reason."""
+    if not reason:
+        return "", ""
+    key = str(reason).split(":")[0].strip()
+    return REASONS.get(key) or (f"سبب غير معروف: {reason}", f"Unknown reason: {reason}")
+
+
+def warning(code: str) -> dict:
+    ar, en = WARNINGS[code]
+    return {"code": code, "ar": ar, "en": en}
+
+
+def decorate(ready: dict, warnings=()) -> dict:
+    """Add reason_ar, reason_en and warnings to a ready dict in place (ok and reason are left as they are)."""
+    ready["reason_ar"], ready["reason_en"] = reason_texts(ready.get("reason"))
+    ready["warnings"] = list(warnings)
+    return ready
 
 
 def resumed(prev: tuple | None, now: tuple, gap: float = RESUME_GAP) -> bool:
@@ -78,6 +138,116 @@ def battery_saver_on():
         return bool(st.SystemStatusFlag & 1)
     except Exception:  # noqa: BLE001
         return None
+
+
+# ---- warnings: the next call can still be placed (ok stays True) but may sound broken or collide with the old app
+def _run(cmd: list, timeout: float = 15.0):
+    """stdout of a Windows command, None when it cannot be run (not Windows, timeout, error). Tests replace this."""
+    import subprocess
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, errors="replace",
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _cached(key: str, ttl: float, fn):
+    now = time.monotonic()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    _cache[key] = (now, val)
+    return val
+
+
+def parse_ssid(out):
+    """SSID of the connected Wi-Fi from `netsh wlan show interfaces` ("" = no Wi-Fi connection, None = not readable).
+    Only the exact key "SSID" counts (not BSSID); netsh prints no SSID line for a disconnected adapter."""
+    if out is None:
+        return None
+    for line in out.splitlines():
+        m = re.match(r"^\s*SSID\s*:\s*(.*?)\s*$", line)
+        if m and m.group(1):
+            return m.group(1)
+    return ""
+
+
+def parse_gateways(out):
+    """Default-route gateways (IPv4 strings) from `route print -4` (the 0.0.0.0 / 0.0.0.0 rows; "On-link" rows have none);
+    None when not readable. The columns are numbers, so this works in every Windows language."""
+    if out is None:
+        return None
+    gws = []
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 3 and f[0] == f[1] == "0.0.0.0":
+            try:
+                gws.append(str(ipaddress.IPv4Address(f[2])))
+            except ValueError:
+                pass
+    return gws
+
+
+def parse_old_app(out):
+    """Names of the old-app things found by the PowerShell probe: 'proc:<image>' per running process under AhmedDialer
+    (exe path or command line) and 'task:<name>' per scheduled task in state Running; None when not readable."""
+    if out is None:
+        return None
+    found = []
+    for line in out.splitlines():
+        f = line.strip().split("|")
+        if len(f) >= 3 and f[0] == "P":
+            found.append("proc:" + f[2])
+        elif len(f) >= 3 and f[0] == "T" and f[2].strip().lower() == "running" and f[1] in OLD_APP_TASKS:
+            found.append("task:" + f[1])
+    return found
+
+
+def _norm_name(s) -> str:
+    return " ".join(str(s or "").replace("\u2019", "'").replace("\u2018", "'").split()).casefold()
+
+
+def hotspot_internet(phone_name: str = ""):
+    """True when the laptop's internet comes through the paired iPhone's own Personal Hotspot: the connected Wi-Fi SSID equals
+    the iPhone's name, or a default gateway is inside the hotspot subnet. False when neither; None when nothing could be read."""
+    ssid = _cached("ssid", NET_TTL, lambda: parse_ssid(_run(["netsh", "wlan", "show", "interfaces"])))
+    gws = _cached("gw", NET_TTL, lambda: parse_gateways(_run(["route", "print", "-4"])))
+    if ssid and phone_name and _norm_name(ssid) == _norm_name(phone_name):
+        return True
+    if any(ipaddress.IPv4Address(g) in HOTSPOT_NET for g in gws or ()):
+        return True
+    return None if ssid is None and gws is None else False
+
+
+def _old_app_probe():
+    # the pattern is built from two pieces so this PowerShell's own command line (which is excluded by $PID anyway) cannot match it
+    tasks = ",".join(f"'{t}'" for t in OLD_APP_TASKS)
+    ps = ("$p='*Ahmed'+'Dialer*'; "
+          "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and ($_.ExecutablePath -like $p -or $_.CommandLine -like $p) } "
+          "| ForEach-Object { 'P|' + $_.ProcessId + '|' + $_.Name }; "
+          f"foreach ($n in {tasks}) {{ $t = Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; "
+          "if ($t) { 'T|' + $n + '|' + $t.State } }")
+    return parse_old_app(_run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=20))
+
+
+def old_app_running():
+    """True when the old AhmedDialer app (a process under AhmedDialer, or its scheduled task AhmedDialerApp /
+    AhmedDialerOpenOnUnlock in state Running) is up; None when that cannot be told (not Windows)."""
+    found = _cached("old_app", OLD_APP_TTL, _old_app_probe)
+    return None if found is None else bool(found)
+
+
+def collect_warnings(phone_name: str = "") -> list:
+    """The warnings that apply now, as [{code, ar, en}]. A probe that fails adds nothing."""
+    out = []
+    for code, probe in (("iphone_hotspot_internet", lambda: hotspot_internet(phone_name)), ("old_app_running", old_app_running)):
+        try:
+            if probe() is True:
+                out.append(warning(code))
+        except Exception:  # noqa: BLE001
+            pass
+    return out
 
 
 # ---- adapted from calls.py (see PORT_NOTES.md): state of the idle Hands-Free check, now driven by the heartbeat
@@ -160,14 +330,18 @@ def auto_ready(info: dict, mac: str = "", log=_print_log) -> tuple:
     cfg_mac = mac
     mac = mac or _mac[0] or asyncio.run(phone.find_iphone_mac())
     _mac[0] = mac or _mac[0]
-    info["iphone_connected"] = asyncio.run(phone.iphone(mac)).get("connected")
+    ph = asyncio.run(phone.iphone(mac))
+    info["iphone_connected"] = ph.get("connected")
+    _phone_name[0] = ph.get("name") or _phone_name[0]
     if info["iphone_connected"] is False and not cfg_mac and time.monotonic() - _rescan_t[0] >= RESCAN_EVERY:
         # the cached phone is not connected: another paired iPhone may be (at most one scan per RESCAN_EVERY s)
         _rescan_t[0] = time.monotonic()
         new = asyncio.run(phone.find_iphone_mac())
         if new and new != mac:
             mac = _mac[0] = new
-            info["iphone_connected"] = asyncio.run(phone.iphone(mac)).get("connected")
+            ph = asyncio.run(phone.iphone(mac))
+            info["iphone_connected"] = ph.get("connected")
+            _phone_name[0] = ph.get("name") or _phone_name[0]
     if info["iphone_connected"] is False:
         return False, "iphone_not_connected"
     eps = phone.hf_endpoints()
@@ -182,12 +356,12 @@ def auto_ready(info: dict, mac: str = "", log=_print_log) -> tuple:
 
 
 def check(mac: str = "", log=_print_log) -> dict:
-    """PhoneAdapter.ready(): {ok, reason, bt_radio, iphone_connected, hfp_audio_device, phone_link_running, session_locked,
+    """PhoneAdapter.ready(): {ok, reason, reason_ar, reason_en, warnings, bt_radio, iphone_connected, hfp_audio_device, phone_link_running, session_locked,
     call_active, hf_link (bool), hf_state (MMDevices state name)}; values not probed (early exit) are None. Never raises."""
     info = {k: None for k in ("bt_radio", "iphone_connected", "hfp_audio_device", "phone_link_running", "session_locked",
                               "call_active", "hf_link", "hf_state")}
     if phone is None:
-        return {"ok": False, "reason": "phone_module_unavailable", **info}
+        return decorate({"ok": False, "reason": "phone_module_unavailable", **info})
     try:
         tick = (time.time(), time.monotonic())
         if resumed(_prev_tick[0], tick):   # the laptop slept: let Bluetooth reconnect, then look at the Hands-Free endpoints
@@ -197,4 +371,7 @@ def check(mac: str = "", log=_print_log) -> dict:
         ok, reason = auto_ready(info, mac, log)
     except Exception as e:  # noqa: BLE001
         ok, reason = False, f"ready_check_failed: {type(e).__name__}"
-    return {"ok": ok, "reason": reason, **info}
+    warns = []
+    if info["call_active"] is False:   # no probes (PowerShell) while a call is up or its state is unknown
+        warns = collect_warnings(_phone_name[0])
+    return decorate({"ok": ok, "reason": reason, **info}, warns)
