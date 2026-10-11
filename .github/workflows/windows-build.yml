@@ -68,7 +68,9 @@ jobs:
         shell: pwsh
         run: |
           $env:YC_UPDATE_URL = 'http://127.0.0.1:9/none'     # the app that auto-starts must not touch the real releases
-          Start-Process "dist\installer\YoussefConnector-Setup-$env:APP_VERSION.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/LOG=install.log' -Wait
+          # WaitForExit, not Start-Process -Wait: -Wait also waits for the app the installer starts (nowait child)
+          $ip = Start-Process "dist\installer\YoussefConnector-Setup-$env:APP_VERSION.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/LOG=install.log' -PassThru
+          $ip.WaitForExit()
           $exe = "$env:LOCALAPPDATA\Programs\YoussefConnector\YoussefConnector.exe"
           if (-not (Test-Path $exe)) { Get-Content install.log -Tail 40; throw "not installed: $exe" }
           Get-Process YoussefConnector -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -98,7 +100,8 @@ jobs:
         shell: pwsh
         run: |
           $dir = "$env:LOCALAPPDATA\Programs\YoussefConnector"
-          Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -Wait
+          $up = Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -PassThru
+          $up.WaitForExit()
           Start-Sleep 3
           if (Test-Path "$dir\YoussefConnector.exe") { throw 'uninstall left the exe behind' }
           Write-Host 'uninstalled'

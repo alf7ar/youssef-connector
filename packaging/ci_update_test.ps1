@@ -46,7 +46,8 @@ Start-Sleep 2
 # children (the installer, the app it starts) inherit these
 $env:YC_HOME = $home_; $env:YC_UPDATE_URL = 'http://127.0.0.1:8765/latest.json'; $env:YC_UPDATE_EVERY = '4'; $env:YC_PORT = '0'
 try {
-    Start-Process $s1 -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+    # WaitForExit, not -Wait: -Wait also waits for the app the installer starts
+    $ip = Start-Process $s1 -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -PassThru; $ip.WaitForExit()
     Wait-Until { (Installed-Version) -eq '0.0.1' } 60 'v0.0.1 installed'
     Wait-Until { Get-Process YoussefConnector -ErrorAction SilentlyContinue } 30 'v0.0.1 running'
     Write-Host "OK installed 0.0.1 and running"
@@ -68,6 +69,6 @@ try {
 } finally {
     Get-Process YoussefConnector -ErrorAction SilentlyContinue | Stop-Process -Force
     $un = Join-Path $appdir 'unins000.exe'
-    if (Test-Path $un) { Start-Process $un -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES' -Wait }
+    if (Test-Path $un) { $up = Start-Process $un -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES' -PassThru; $up.WaitForExit() }
     Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
 }
