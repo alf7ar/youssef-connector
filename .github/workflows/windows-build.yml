@@ -1,11 +1,11 @@
 name: windows-build
-# Tests -> PyInstaller (onedir) -> Inno Setup -> silent install -> --selftest -> mock-hub e2e -> uninstall.
+# Tests (incl. the Windows COM/GC stress) -> PyInstaller (onedir) -> built-exe --selftest -> Inno Setup -> silent install -> --selftest -> mock-hub e2e -> uninstall.
 # Tag vX.Y.Z-rcN is a pre-release: only latest-beta.json (release beta-channel), never latest.json.
 # Tag vX.Y.Z publishes a GitHub Release (versioned exe, unversioned alias YoussefConnector-Setup.exe, .sha256, latest.json).
 # Separate jobs: gitleaks and auto-update. No secrets are used or baked in: the connect code is entered on the user's PC.
 on:
   push:
-    branches: [master]
+    branches: [master, 'night/**']
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -46,10 +46,24 @@ jobs:
           python -m pip install -r packaging/requirements-win.txt
 
       - name: Tests (core, main, update)
-        run: python -m pytest -q
+        run: python -m pytest -q -rP   # -rP prints the COM stress verdict (old pattern: survived or crashed)
 
       - name: PyInstaller build
         run: python -m PyInstaller packaging/YoussefConnector.spec --noconfirm --distpath dist --workpath build/pyi
+
+      - name: "Selftest (built exe straight from PyInstaller, must finish in 60 s)"
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'selftest-built.txt'
+          $env:YC_HOME = Join-Path $env:RUNNER_TEMP 'yc-built-home'
+          $p = Start-Process -FilePath dist\YoussefConnector\YoussefConnector.exe -ArgumentList '--selftest','--selftest-out',$out -PassThru
+          $done = $p.WaitForExit(60000)
+          if (-not $done) { $p.Kill(); Write-Host 'selftest still running after 60 s'; }
+          if (Test-Path $out) { Get-Content $out } else { Write-Host 'NO SELFTEST OUTPUT' }
+          if (Test-Path "$env:YC_HOME\crash.log") { Write-Host '--- crash.log'; Get-Content "$env:YC_HOME\crash.log" -Tail 60 }
+          if (-not $done) { throw 'built exe --selftest exceeded 60 s' }
+          if ($p.ExitCode -ne 0) { throw "built exe selftest exit code $($p.ExitCode)" }
 
       - name: Inno Setup compile
         shell: pwsh

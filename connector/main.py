@@ -2,8 +2,9 @@
 
 First run: a small page on 127.0.0.1 asks for the connect code (base64url JSON {"u": hub url, "t": token}) copied from the
 dashboard and checks it with GET /connector/ping. Config lives in %LOCALAPPDATA%\\YoussefConnector\\config.json.
-Flags: --selftest [--selftest-out FILE]  imports + VAD model + a fake audio loop through the core against the bundled mock
-                                         hub; needs ZERO audio devices and no connect code
+Flags: --selftest [--selftest-out FILE]  imports of every module, faulthandler, COM init through micguard (Windows), VAD model
+                                         + a fake call through the core against the bundled mock hub; ZERO audio devices, no
+                                         connect code; exits 0/1 within 60 s (a hang dumps all stacks and exits)
        --e2e [--selftest-out FILE]       the real app flow (config, status page, core) with fake adapters against the mock hub
        --no-update                       skip the update check
 Env (tests/CI only): YC_HOME (data dir), YC_UPDATE_URL (manifest override), YC_UPDATE_EVERY (seconds between update checks),
@@ -11,6 +12,7 @@ YC_FAKE=1 (fake adapters), YC_PORT (status page port)."""
 import asyncio
 import base64
 import contextlib
+import importlib
 import json
 import os
 import socket
@@ -416,23 +418,50 @@ def _check_vad():
     return f"silence confidence {c:.3f}"
 
 
+SELFTEST_LIMIT_S = 55
+
+
 def selftest(out: Path = None) -> int:
     lines, ok = [], True
+    fh = open(out, "w", encoding="utf-8", buffering=1) if out else None   # line-buffered: a hang still leaves the steps done so far
+
+    def emit(line):
+        lines.append(line)
+        if fh:
+            fh.write(line + "\n")
 
     def step(name, fn):
         nonlocal ok
         try:
+            emit(f"START {name}")
             r = fn()
-            lines.append(f"PASS {name}" + (f": {r}" if r else ""))
+            emit(f"PASS {name}" + (f": {r}" if r else ""))
         except Exception as e:  # noqa: BLE001
             ok = False
-            lines.append(f"FAIL {name}: {type(e).__name__}: {e}")
-            lines.append(traceback.format_exc(limit=4))
+            emit(f"FAIL {name}: {type(e).__name__}: {e}")
+            emit(traceback.format_exc(limit=4))
 
     def imports():
         import numpy, onnxruntime, soxr, websockets  # noqa: F401,E401
-        from . import core, fakes  # noqa: F401
-        return f"version {read_version()}"
+        mods = ["core", "fakes", "vad", "update", "readiness", "micguard", "comstress"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
+        for m in mods:
+            importlib.import_module(f"{__package__ or 'connector'}.{m}")
+        return f"version {read_version()}, {len(mods)} connector modules"
+
+    def crash_log():
+        import faulthandler
+        assert faulthandler.is_enabled(), "faulthandler is off"
+        return "faulthandler on"
+
+    def com_init():
+        if os.name != "nt":
+            return "skipped (not Windows)"
+        from . import comstress, micguard
+        micguard._com_thread(lambda c: comstress._create(c))
+        assert micguard._mta_keeper and micguard._mta_keeper[0].is_alive(), "MTA keeper thread is not running"
+        r = comstress.run(60)
+        assert r["created"] == 60 and r["mta_keeper_alive"], r
+        return f"micguard COM thread ok, mta-keeper alive, {r['created']} wrappers gc'd off-thread ({r['finalised_on_gc_thread']}) in {r['secs']}s"
 
     def audio_imports():
         if os.name != "nt":
@@ -442,19 +471,25 @@ def selftest(out: Path = None) -> int:
         return "soundcard/WASAPI/pycaw import ok"
 
     def fake_loop():
-        reason = asyncio.run(asyncio.wait_for(_fake_call_loop(read_version()), 90))
+        reason = asyncio.run(asyncio.wait_for(_fake_call_loop(read_version()), 40))
         assert reason == "agent_end", reason
         return f"ended={reason}"
 
+    import faulthandler
+    with contextlib.suppress(Exception):   # no --selftest-out and no stderr (windowed exe): no watchdog
+        faulthandler.dump_traceback_later(SELFTEST_LIMIT_S, exit=True, file=fh or sys.stderr)   # a hang dumps every thread's stack, exit 1
+    t0 = time.time()
     step("imports", imports)
+    step("crash-log", crash_log)
+    step("com-init", com_init)
     step("audio-imports", audio_imports)
     step("vad-model", _check_vad)
     step("fake-audio-loop", fake_loop)
-    lines.append("SELFTEST " + ("OK" if ok else "FAILED"))
-    text = "\n".join(lines)
-    print(text, flush=True)
-    if out:
-        Path(out).write_text(text + "\n", encoding="utf-8")
+    faulthandler.cancel_dump_traceback_later()
+    emit("SELFTEST " + ("OK" if ok else "FAILED") + f" in {time.time() - t0:.1f}s")
+    if fh:
+        fh.close()
+    print("\n".join(l for l in lines if not l.startswith("START ")), flush=True)
     return 0 if ok else 1
 
 
