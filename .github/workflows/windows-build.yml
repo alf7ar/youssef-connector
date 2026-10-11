@@ -1,5 +1,6 @@
 name: windows-build
 # Tests -> PyInstaller (onedir) -> Inno Setup -> silent install -> --selftest -> mock-hub e2e -> uninstall.
+# Tag vX.Y.Z-rcN is a pre-release: only latest-beta.json (release beta-channel), never latest.json.
 # Tag vX.Y.Z publishes a GitHub Release (versioned exe, unversioned alias YoussefConnector-Setup.exe, .sha256, latest.json).
 # Separate jobs: gitleaks and auto-update. No secrets are used or baked in: the connect code is entered on the user's PC.
 on:
@@ -30,9 +31,13 @@ jobs:
         run: |
           if ($env:GITHUB_REF_TYPE -eq 'tag') { $v = $env:GITHUB_REF_NAME.TrimStart('v') }
           else { $v = (Get-Content VERSION -Raw).Trim() }
-          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "bad version '$v'" }
+          if ($v -notmatch '^\d+\.\d+\.\d+(-rc\d+)?$') { throw "bad version '$v'" }
           [IO.File]::WriteAllText("$PWD\VERSION", "$v`n")
           "APP_VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          # pre-release tag (v0.1.2-rc1): beta channel only, never latest.json / the unversioned alias / "latest" release
+          $pre = if ($v -match '-') { 'true' } else { 'false' }
+          "IS_PRERELEASE=$pre" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "NUM_VERSION=$($v.Split('-')[0])" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           Write-Host "version $v"
 
       - name: Install requirements
@@ -52,7 +57,7 @@ jobs:
           choco upgrade innosetup -y --no-progress
           $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
           if (-not (Test-Path $iscc)) { throw 'ISCC.exe not found' }
-          & $iscc "/DAppVersion=$env:APP_VERSION" packaging\YoussefConnector.iss
+          & $iscc "/DAppVersion=$env:APP_VERSION" "/DNumVersion=$env:NUM_VERSION" packaging\YoussefConnector.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed $LASTEXITCODE" }
           $name = "YoussefConnector-Setup-$env:APP_VERSION.exe"
           $exe = "dist\installer\$name"
@@ -61,7 +66,9 @@ jobs:
           Copy-Item $exe dist\installer\YoussefConnector-Setup.exe
           "$h  YoussefConnector-Setup.exe" | Out-File -Encoding ascii dist\installer\YoussefConnector-Setup.exe.sha256
           $m = @{ version = $env:APP_VERSION; url = "https://github.com/${{ github.repository }}/releases/download/v$env:APP_VERSION/$name"; sha256 = $h } | ConvertTo-Json -Compress
-          [IO.File]::WriteAllText("$PWD\dist\installer\latest.json", $m)
+          # stable -> latest.json; pre-release -> latest-beta.json only (latest.json must never describe a pre-release)
+          $mf = if ($env:IS_PRERELEASE -eq 'true') { 'latest-beta.json' } else { 'latest.json' }
+          [IO.File]::WriteAllText("$PWD\dist\installer\$mf", $m)
           Write-Host "sha256 $h size $((Get-Item $exe).Length)"
 
       - name: Silent install
@@ -125,12 +132,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $files = @("dist\installer\YoussefConnector-Setup-$env:APP_VERSION.exe", "dist\installer\YoussefConnector-Setup-$env:APP_VERSION.exe.sha256",
-                     "dist\installer\YoussefConnector-Setup.exe", "dist\installer\YoussefConnector-Setup.exe.sha256", "dist\installer\latest.json")
-          gh release view $env:GITHUB_REF_NAME 2>$null
-          if ($LASTEXITCODE -eq 0) { gh release upload $env:GITHUB_REF_NAME @files --clobber }
-          else { gh release create $env:GITHUB_REF_NAME @files --title "Youssef Connector $env:APP_VERSION" --notes "Install: https://github.com/${{ github.repository }}/releases/latest/download/YoussefConnector-Setup.exe" }
-          if ($LASTEXITCODE -ne 0) { throw 'gh release failed' }
+          if ($env:IS_PRERELEASE -eq 'true') {
+            # pre-release: versioned exe + sha + latest-beta.json only; GitHub's /releases/latest ignores pre-releases
+            $files = @("dist\installer\YoussefConnector-Setup-$env:APP_VERSION.exe", "dist\installer\YoussefConnector-Setup-$env:APP_VERSION.exe.sha256")
+            gh release view $env:GITHUB_REF_NAME 2>$null
+            if ($LASTEXITCODE -eq 0) { gh release upload $env:GITHUB_REF_NAME @files --clobber }
+            else { gh release create $env:GITHUB_REF_NAME @files --prerelease --title "Youssef Connector $env:APP_VERSION (beta)" --notes "Pre-release for the beta update channel." }
+            if ($LASTEXITCODE -ne 0) { throw 'gh release failed' }
+            # fixed beta pointer release: https://github.com/<repo>/releases/download/beta-channel/latest-beta.json
+            $bf = @("dist\installer\latest-beta.json")
+            gh release view beta-channel 2>$null
+            if ($LASTEXITCODE -eq 0) { gh release upload beta-channel @bf --clobber }
+            else { gh release create beta-channel @bf --prerelease --target ${{ github.sha }} --title "Beta channel pointer" --notes "Holds latest-beta.json for config channel=beta. Not an installer release." }
+            if ($LASTEXITCODE -ne 0) { throw 'gh beta-channel release failed' }
+          } else {
+            $files = @("dist\installer\YoussefConnector-Setup-$env:APP_VERSION.exe", "dist\installer\YoussefConnector-Setup-$env:APP_VERSION.exe.sha256",
+                       "dist\installer\YoussefConnector-Setup.exe", "dist\installer\YoussefConnector-Setup.exe.sha256", "dist\installer\latest.json")
+            gh release view $env:GITHUB_REF_NAME 2>$null
+            if ($LASTEXITCODE -eq 0) { gh release upload $env:GITHUB_REF_NAME @files --clobber }
+            else { gh release create $env:GITHUB_REF_NAME @files --title "Youssef Connector $env:APP_VERSION" --notes "Install: https://github.com/${{ github.repository }}/releases/latest/download/YoussefConnector-Setup.exe" }
+            if ($LASTEXITCODE -ne 0) { throw 'gh release failed' }
+          }
 
   auto-update:
     needs: build

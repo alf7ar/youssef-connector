@@ -5,6 +5,9 @@
 #ifndef AppVersion
   #define AppVersion "0.0.0"
 #endif
+#ifndef NumVersion
+  #define NumVersion AppVersion
+#endif
 #ifndef SrcDir
   #define SrcDir "..\dist\YoussefConnector"
 #endif
@@ -20,7 +23,7 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher=Alfhar
-VersionInfoVersion={#AppVersion}
+VersionInfoVersion={#NumVersion}
 DefaultDirName={localappdata}\Programs\YoussefConnector
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
