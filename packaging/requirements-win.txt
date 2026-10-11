@@ -1,0 +1,4 @@
+# Build-time requirements of the packaged Windows exe (CI: windows-build.yml). Python 3.13.
+-r requirements.txt
+pyinstaller
+pytest

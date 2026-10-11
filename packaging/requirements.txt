@@ -1,0 +1,17 @@
+# Runtime packages. numpy/soxr/websockets are also what the Linux tests need.
+numpy
+soxr==1.1.0
+websockets==15.0.1
+onnxruntime
+sounddevice
+soundcard
+comtypes
+pycaw
+psutil
+winrt-runtime
+winrt-Windows.ApplicationModel.Calls
+winrt-Windows.Devices.Bluetooth
+winrt-Windows.Devices.Enumeration
+winrt-Windows.Devices.Radios
+winrt-Windows.Foundation
+winrt-Windows.Foundation.Collections

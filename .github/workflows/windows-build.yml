@@ -1,0 +1,162 @@
+name: windows-build
+# Tests -> PyInstaller (onedir) -> Inno Setup -> silent install -> --selftest -> mock-hub e2e -> uninstall.
+# Tag vX.Y.Z publishes a GitHub Release (versioned exe, unversioned alias YoussefConnector-Setup.exe, .sha256, latest.json).
+# Separate jobs: gitleaks and auto-update. No secrets are used or baked in: the connect code is entered on the user's PC.
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: packaging/requirements-win.txt
+
+      - name: Version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') { $v = $env:GITHUB_REF_NAME.TrimStart('v') }
+          else { $v = (Get-Content VERSION -Raw).Trim() }
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "bad version '$v'" }
+          [IO.File]::WriteAllText("$PWD\VERSION", "$v`n")
+          "APP_VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Write-Host "version $v"
+
+      - name: Install requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r packaging/requirements-win.txt
+
+      - name: Tests (core, main, update)
+        run: python -m pytest -q
+
+      - name: PyInstaller build
+        run: python -m PyInstaller packaging/YoussefConnector.spec --noconfirm --distpath dist --workpath build/pyi
+
+      - name: Inno Setup compile
+        shell: pwsh
+        run: |
+          choco upgrade innosetup -y --no-progress
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw 'ISCC.exe not found' }
+          & $iscc "/DAppVersion=$env:APP_VERSION" packaging\YoussefConnector.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed $LASTEXITCODE" }
+          $name = "YoussefConnector-Setup-$env:APP_VERSION.exe"
+          $exe = "dist\installer\$name"
+          $h = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLower()
+          "$h  $name" | Out-File -Encoding ascii "$exe.sha256"
+          Copy-Item $exe dist\installer\YoussefConnector-Setup.exe
+          "$h  YoussefConnector-Setup.exe" | Out-File -Encoding ascii dist\installer\YoussefConnector-Setup.exe.sha256
+          $m = @{ version = $env:APP_VERSION; url = "https://github.com/${{ github.repository }}/releases/download/v$env:APP_VERSION/$name"; sha256 = $h } | ConvertTo-Json -Compress
+          [IO.File]::WriteAllText("$PWD\dist\installer\latest.json", $m)
+          Write-Host "sha256 $h size $((Get-Item $exe).Length)"
+
+      - name: Silent install
+        shell: pwsh
+        run: |
+          $env:YC_UPDATE_URL = 'http://127.0.0.1:9/none'     # the app that auto-starts must not touch the real releases
+          Start-Process "dist\installer\YoussefConnector-Setup-$env:APP_VERSION.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/LOG=install.log' -Wait
+          $exe = "$env:LOCALAPPDATA\Programs\YoussefConnector\YoussefConnector.exe"
+          if (-not (Test-Path $exe)) { Get-Content install.log -Tail 40; throw "not installed: $exe" }
+          Get-Process YoussefConnector -ErrorAction SilentlyContinue | Stop-Process -Force
+          Write-Host "installed $exe"
+
+      - name: "Selftest (installed exe; imports, VAD model, fake audio loop, zero devices)"
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'selftest.txt'
+          $exe = "$env:LOCALAPPDATA\Programs\YoussefConnector\YoussefConnector.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList '--selftest','--selftest-out',$out -Wait -PassThru
+          if (Test-Path $out) { Get-Content $out } else { Write-Host 'NO SELFTEST OUTPUT' }
+          if ($p.ExitCode -ne 0) { throw "selftest exit code $($p.ExitCode)" }
+
+      - name: "Mock-hub e2e (installed exe: config, status page, core, fake adapters)"
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'e2e.txt'
+          $exe = "$env:LOCALAPPDATA\Programs\YoussefConnector\YoussefConnector.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList '--e2e','--selftest-out',$out -Wait -PassThru
+          if (Test-Path $out) { Get-Content $out } else { Write-Host 'NO E2E OUTPUT' }
+          if ($p.ExitCode -ne 0) { throw "e2e exit code $($p.ExitCode)" }
+
+      - name: Uninstall
+        shell: pwsh
+        run: |
+          $dir = "$env:LOCALAPPDATA\Programs\YoussefConnector"
+          Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -Wait
+          Start-Sleep 3
+          if (Test-Path "$dir\YoussefConnector.exe") { throw 'uninstall left the exe behind' }
+          Write-Host 'uninstalled'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: YoussefConnector-${{ env.APP_VERSION }}
+          path: |
+            dist/installer/*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onedir
+          path: dist/YoussefConnector
+          retention-days: 1
+
+      - name: GitHub release (tags only)
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = @("dist\installer\YoussefConnector-Setup-$env:APP_VERSION.exe", "dist\installer\YoussefConnector-Setup-$env:APP_VERSION.exe.sha256",
+                     "dist\installer\YoussefConnector-Setup.exe", "dist\installer\YoussefConnector-Setup.exe.sha256", "dist\installer\latest.json")
+          gh release view $env:GITHUB_REF_NAME 2>$null
+          if ($LASTEXITCODE -eq 0) { gh release upload $env:GITHUB_REF_NAME @files --clobber }
+          else { gh release create $env:GITHUB_REF_NAME @files --title "Youssef Connector $env:APP_VERSION" --notes "Install: https://github.com/${{ github.repository }}/releases/latest/download/YoussefConnector-Setup.exe" }
+          if ($LASTEXITCODE -ne 0) { throw 'gh release failed' }
+
+  auto-update:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: onedir
+          path: dist/YoussefConnector
+      - name: Inno Setup
+        shell: pwsh
+        run: choco upgrade innosetup -y --no-progress
+      - name: "Auto-update test (0.0.1 -> 0.0.2 over the running app; tampered sha256 rejected)"
+        shell: pwsh
+        run: ./packaging/ci_update_test.ps1
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks (pinned release, checksum verified)
+        run: |
+          v=8.30.1
+          curl -fsSL -o gl.tgz "https://github.com/gitleaks/gitleaks/releases/download/v$v/gitleaks_${v}_linux_x64.tar.gz"
+          curl -fsSL -o gl.sums "https://github.com/gitleaks/gitleaks/releases/download/v$v/gitleaks_${v}_checksums.txt"
+          grep " gitleaks_${v}_linux_x64.tar.gz\$" gl.sums | sed 's# gitleaks_.*# gl.tgz#' | sha256sum -c -
+          tar xzf gl.tgz gitleaks
+          ./gitleaks git . --no-banner --redact --exit-code 1
