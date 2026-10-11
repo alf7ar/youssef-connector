@@ -32,6 +32,9 @@ SRC_FRAME_BYTES = 640    # 20 ms PCM16 @ 16 kHz
 NET_FRAME_BYTES = 1920   # 80 ms PCM16 @ 24 kHz
 PREROLL_FRAMES = 50      # 1 s of 20 ms frames
 BUSY_RING_MAX = 5.0
+WS_PING_INTERVAL = 10.0  # s between websocket keepalive pings (both sockets); a silent network is noticed after at most
+WS_PING_TIMEOUT = 10.0   # interval + timeout + close timeout = 22 s, before the hub gives up on a connector without
+WS_CLOSE_TIMEOUT = 2.0   # heartbeats (30 s). The library defaults (20 + 20 + 10) would leave the phone line up for 50 s.
 REASONS = {"callee_hangup", "call_ended", "no_answer", "busy", "no_speech", "dial_failed", "audio_error",
            "hangup_cmd", "agent_end"}
 _ABORT = object()
@@ -184,7 +187,8 @@ class Connector:
             ws = None
             try:
                 async with connect(self.base + "/connector/ws", additional_headers=self.headers, open_timeout=10,
-                                   max_size=2 ** 22) as ws:
+                                   max_size=2 ** 22, ping_interval=WS_PING_INTERVAL, ping_timeout=WS_PING_TIMEOUT,
+                                   close_timeout=WS_CLOSE_TIMEOUT) as ws:
                     await self._session(ws)
             except (OSError, websockets.WebSocketException, asyncio.TimeoutError) as e:
                 self.log("control connect/session failed:", repr(e))
@@ -382,7 +386,9 @@ class Connector:
             return
         try:
             async with connect(f"{self.base}/call/{call.id}/ws", additional_headers=self.headers,
-                               open_timeout=ACK_TIMEOUT, max_size=2 ** 22) as cws:
+                               open_timeout=ACK_TIMEOUT, max_size=2 ** 22,
+                               ping_interval=WS_PING_INTERVAL, ping_timeout=WS_PING_TIMEOUT,
+                               close_timeout=WS_CLOSE_TIMEOUT) as cws:
                 call.ws = cws
                 await self._call_socket(call, cws, preroll)
         except (OSError, websockets.WebSocketException, asyncio.TimeoutError) as e:

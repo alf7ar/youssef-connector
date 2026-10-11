@@ -472,3 +472,26 @@ def test_control_loss_mid_call_hangs_up():
                 await asyncio.sleep(0.02)
             assert r.phone.hangups == 1
     run(go())
+
+
+def test_blackholed_network_mid_call_hangs_up_within_ping_timeout(monkeypatch):
+    """A network that silently stops answering (no close, no reset) must still end the call locally: the hub gives up on a
+    silent connector after 30 s, so the connector's own keepalive has to fire first or the phone line stays up."""
+    monkeypatch.setattr(cc, "WS_PING_INTERVAL", 0.3, raising=False)
+    monkeypatch.setattr(cc, "WS_PING_TIMEOUT", 0.3, raising=False)
+    monkeypatch.setattr(cc, "WS_CLOSE_TIMEOUT", 0.3, raising=False)
+
+    async def go():
+        async with rig("answer") as r:
+            await place(r)
+            call = await r.hub.wait_call("c1")
+            r.hub.control.transport.pause_reading()   # the hub side stops reading: pings go unanswered
+            call.ws.transport.pause_reading()
+            for _ in range(300):
+                if r.phone.hangups:
+                    break
+                await asyncio.sleep(0.02)
+            assert r.phone.hangups == 1
+            await asyncio.sleep(0.3)
+            assert r.audio.sources and all(s._stop.is_set() for s in r.audio.sources)
+    run(go())
