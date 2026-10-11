@@ -25,7 +25,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import update
+from . import logsend, update
 
 MUTEX = "Global\\YoussefConnector"
 PORT = 5076
@@ -74,9 +74,9 @@ def parse_connect_code(code: str) -> tuple:
         d = json.loads(base64.urlsafe_b64decode(code + "=" * (-len(code) % 4)).decode("utf-8"))
         url, tok = str(d["u"]).strip().rstrip("/"), str(d["t"]).strip()
     except Exception:  # noqa: BLE001
-        raise ValueError("Invalid code / الكود غير صحيح") from None
+        raise ValueError("الكود غير صحيح / Invalid code") from None
     if not tok or not url.lower().startswith(("https://", "http://127.0.0.1", "http://localhost", "wss://", "ws://127.0.0.1")):
-        raise ValueError("Invalid code / الكود غير صحيح")
+        raise ValueError("الكود غير صحيح / Invalid code")
     return url, tok
 
 
@@ -96,10 +96,10 @@ def check_code(url: str, token: str, timeout: float = 10) -> tuple:
             return (r.status == 200 and json.loads(r.read().decode("utf-8")).get("ok") is True), "OK"
     except urllib.error.HTTPError as e:
         if e.code in (401, 403, 4401):
-            return False, "Wrong or old code / الكود قديم أو غير صحيح"
-        return False, f"Server error {e.code} / خطأ في الخادم"
+            return False, "الكود قديم أو غير صحيح / Wrong or old code"
+        return False, f"خطأ في الخادم / Server error {e.code}"
     except Exception as e:  # noqa: BLE001
-        return False, f"No connection / لا يوجد اتصال ({type(e).__name__})"
+        return False, f"لا يوجد اتصال / No connection ({type(e).__name__})"
 
 
 def single_instance() -> bool:
@@ -128,30 +128,42 @@ def build_adapters(clock=None, cfg=None, log=None):
     return win_adapters.build(cfg=cfg, log=log)
 
 
+def _reason_texts(reason) -> tuple:
+    from . import core
+    return core._reason_texts(reason)
+
+
 # ------------------------------------------------------------------ app (status page + core)
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Youssef Connector</title><style>
 body{font-family:Segoe UI,Arial,sans-serif;max-width:560px;margin:40px auto;padding:0 16px;color:#222}
 h1{font-size:20px}.card{border:1px solid #ddd;border-radius:8px;padding:14px;margin:12px 0}
 .ok{color:#0a7d32}.bad{color:#b00020}input{width:100%;padding:8px;box-sizing:border-box;font-family:monospace}
-button{padding:8px 16px;margin-top:8px}small{color:#666}</style></head><body>
+button{padding:8px 16px;margin-top:8px}.warn{color:#8a5a00}small{color:#666}</style></head><body>
 <h1>Youssef Connector <small id="ver"></small></h1>
 <div id="connect" class="card" style="display:none">
-<p>Paste the connect code from your dashboard. / الصق كود الربط من لوحة التحكم.</p>
-<input id="code" autocomplete="off" spellcheck="false"><br><button id="go">Connect / ربط</button> <span id="msg"></span></div>
+<p>الصق كود الربط من لوحة التحكم. / Paste the connect code from your dashboard.</p>
+<input id="code" autocomplete="off" spellcheck="false"><br><button id="go">ربط / Connect</button> <span id="msg"></span></div>
 <div id="status" class="card" style="display:none">
-<div>Hub / الخادم: <b id="hub"></b></div><div>Phone / الهاتف: <b id="ready"></b></div>
-<div>Call / المكالمة: <b id="call"></b></div></div>
+<div>الخادم / Hub: <b id="hub"></b></div><div>الهاتف / Phone: <b id="ready"></b></div>
+<div id="warn" class="warn"></div>
+<div>المكالمة / Call: <b id="call"></b></div>
+<button id="logs">إرسال السجلات / Send logs</button> <span id="logmsg"></span></div>
 <script>
 const $=id=>document.getElementById(id);
 async function tick(){try{const s=await (await fetch('/status')).json();$('ver').textContent=s.version;
 $('connect').style.display=s.configured?'none':'block';$('status').style.display=s.configured?'block':'none';
-$('hub').textContent=s.connected?'connected / متصل':'connecting... / جاري الاتصال';$('hub').className=s.connected?'ok':'bad';
-$('ready').textContent=s.ready&&s.ready.ok?'ready / جاهز':'not ready: '+((s.ready&&s.ready.reason)||'');
-$('ready').className=s.ready&&s.ready.ok?'ok':'bad';$('call').textContent=s.call||'none / لا يوجد';}catch(e){}}
+$('hub').textContent=s.connected?'متصل / connected':'جاري الاتصال... / connecting...';$('hub').className=s.connected?'ok':'bad';
+const r=s.ready||{};$('ready').textContent=r.ok?'جاهز / ready':'مش جاهز: '+(r.reason_ar||r.reason||'')+(r.reason_en?' / '+r.reason_en:'');
+$('ready').className=r.ok?'ok':'bad';
+$('warn').replaceChildren(...(r.warnings||[]).map(w=>{const d=document.createElement('div');d.textContent='تنبيه: '+w.ar+' / '+w.en;return d;}));
+$('call').textContent=s.call||'لا يوجد / none';}catch(e){}}
 $('go').onclick=async()=>{$('msg').textContent='...';const r=await fetch('/connect',{method:'POST',
 headers:{'Content-Type':'application/json'},body:JSON.stringify({code:$('code').value})});
 const j=await r.json();$('msg').textContent=j.message;$('msg').className=j.ok?'ok':'bad';tick();};
+$('logs').onclick=async()=>{$('logmsg').textContent='...';try{const r=await fetch('/sendlogs',{method:'POST',
+headers:{'Content-Type':'application/json'},body:'{}'});const j=await r.json();$('logmsg').textContent=j.message;$('logmsg').className=j.ok?'ok':'bad';}
+catch(e){$('logmsg').textContent='فشل / failed';$('logmsg').className='bad';}};
 tick();setInterval(tick,2000);
 </script></body></html>"""
 
@@ -163,6 +175,7 @@ class App:
         self.conn = None
         self.phone = None
         self.audio_route = ""
+        self.loop = None
         self.wake = threading.Event()
         self.stop_event = threading.Event()
         self.message = ""
@@ -178,11 +191,25 @@ class App:
         ready = {}
         if self.phone is not None and c is not None and getattr(c, "_ws", None) is not None:
             with contextlib.suppress(Exception):
-                ready = self.phone.ready()
+                ready = dict(self.phone.ready())
+            if ready and not ready.get("ok") and not ready.get("reason_ar"):
+                ready["reason_ar"], ready["reason_en"] = _reason_texts(ready.get("reason"))
         return {"version": self.version, "configured": self.configured(),
                 "connected": bool(c is not None and getattr(c, "_ws", None) is not None),
                 "ready": ready, "call": (call.id if call is not None and call.reason is None else None),
                 "message": self.message}
+
+    def send_logs(self) -> tuple:
+        """(ok, message): the tails of connector.log + crash.log, redacted, over the control socket. Called from the status-page thread."""
+        c, loop = self.conn, self.loop
+        if c is None or loop is None or getattr(c, "_ws", None) is None:
+            return False, "مفيش اتصال بالخادم / Not connected to the hub"
+        text = logsend.collect(self.home, self.cfg)
+        try:
+            ok = asyncio.run_coroutine_threadsafe(c.send_logs(text), loop).result(15)
+        except Exception:  # noqa: BLE001
+            ok = False
+        return (True, "تم إرسال السجلات / Logs sent") if ok else (False, "فشل الإرسال / Send failed")
 
     def connect(self, code: str) -> tuple:
         try:
@@ -195,7 +222,7 @@ class App:
         self.cfg = {"url": url, "token": tok}
         write_config(self.home, self.cfg)
         self.wake.set()
-        return True, "Connected / تم الربط"
+        return True, "تم الربط / Connected"
 
     def handler(self):
         app = self
@@ -227,9 +254,12 @@ class App:
 
             def do_POST(self):
                 # JSON content type forces a CORS preflight for foreign pages; the Host check stops DNS rebinding
-                if (not self._host_ok() or self.path != "/connect"
+                if (not self._host_ok() or self.path not in ("/connect", "/sendlogs")
                         or not self.headers.get("Content-Type", "").startswith("application/json")):
                     return self._send(403, "forbidden", "text/plain")
+                if self.path == "/sendlogs":
+                    ok, msg = app.send_logs()
+                    return self._send(200, json.dumps({"ok": ok, "message": msg}), "application/json")
                 try:
                     n = min(int(self.headers.get("Content-Length") or 0), 8192)
                     code = json.loads(self.rfile.read(n).decode("utf-8")).get("code", "")
@@ -264,6 +294,7 @@ class App:
 
     async def run(self, check_updates: bool):
         from . import core
+        self.loop = asyncio.get_running_loop()
         self._every = float(os.environ.get("YC_UPDATE_EVERY") or 21600)
         self._last_check = time.monotonic()
         while not self.stop_event.is_set():
@@ -286,13 +317,13 @@ class App:
                     await task
                 return
             if self.conn.stop_reason == "outdated":
-                self.message = "Update required / تحديث مطلوب"
+                self.message = "تحديث مطلوب / Update required"
                 if check_updates and await asyncio.to_thread(update.try_update, self.version, self.home, self.log):
                     self.exit_for_update = True
                     return
                 await asyncio.sleep(60)
             elif self.conn.stop_reason == "replaced":
-                self.message = "Another connector took over / تم تشغيل موصل آخر"
+                self.message = "تم تشغيل موصل آخر / Another connector took over"
                 return
 
 
