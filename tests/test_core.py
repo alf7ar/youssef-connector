@@ -393,7 +393,7 @@ def test_backoff_resets_after_welcome():
 
 def test_hb_cadence_and_payload():
     async def go():
-        clock = RecClock(speed=500)
+        clock = RecClock(speed=100)
         async with rig("answer", clock=clock) as r:
             await r.hub.wait_msg("hello")
             for _ in range(200):
