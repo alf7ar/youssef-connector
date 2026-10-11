@@ -134,7 +134,7 @@ class WinPhone(PhoneAdapter):
     # ---- PhoneAdapter
     def ready(self) -> dict:
         if self.t_dial is not None and not self.ended:
-            return {"ok": False, "reason": "call_active", "call_active": True}
+            return readiness.decorate({"ok": False, "reason": "call_active", "call_active": True})
         return readiness.check(self.mac, self._log)
 
     def dial(self, number: str) -> bool:
