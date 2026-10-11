@@ -25,7 +25,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import update
+from . import guard, update
 
 MUTEX = "Global\\YoussefConnector"
 PORT = 5076
@@ -184,6 +184,16 @@ class App:
                 "ready": ready, "call": (call.id if call is not None and call.reason is None else None),
                 "message": self.message}
 
+    def in_call(self) -> bool:
+        call = getattr(self.conn, "_call", None)
+        return call is not None and call.reason is None
+
+    def try_update(self) -> bool:
+        """Update check that never runs during a call; backs up the app dir for the crash-loop rollback before installing."""
+        before = (lambda: guard.backup_current(self.home, self.version, log=self.log)) if guard.frozen() else None
+        return update.try_update(self.version, self.home, self.log, channel=self.cfg.get("channel"), busy=self.in_call,
+                                 before_launch=before)
+
     def connect(self, code: str) -> tuple:
         try:
             url, tok = parse_connect_code(code)
@@ -253,10 +263,10 @@ class App:
 
     async def _update_due(self, check_updates: bool) -> bool:
         """Periodic update check (every YC_UPDATE_EVERY s, default 6 h). True if an installer was launched."""
-        if not check_updates or time.monotonic() - self._last_check < self._every:
+        if not check_updates or time.monotonic() - self._last_check < self._every or self.in_call():
             return False
         self._last_check = time.monotonic()
-        if await asyncio.to_thread(update.try_update, self.version, self.home, self.log):
+        if await asyncio.to_thread(self.try_update):
             self.exit_for_update = True
             self.stop_event.set()
             return True
@@ -273,6 +283,10 @@ class App:
                 continue
             phone, audio, gate, route = build_adapters(cfg=self.cfg, log=self.log)
             self.phone, self.audio_route = phone, route
+            rb = guard.rolled_back_info(self.home)
+            if rb:
+                ready_orig = phone.ready
+                phone.ready = lambda: {**ready_orig(), "update_rolled_back": rb}
             self.conn = core.Connector(ws_base(self.cfg["url"]), self.cfg["token"], phone, audio, gate,
                                        audio_route=route, version=self.version, log=lambda *a: self.log(*a))
             task = asyncio.create_task(self.conn.run())
@@ -287,7 +301,7 @@ class App:
                 return
             if self.conn.stop_reason == "outdated":
                 self.message = "Update required / تحديث مطلوب"
-                if check_updates and await asyncio.to_thread(update.try_update, self.version, self.home, self.log):
+                if check_updates and await asyncio.to_thread(self.try_update):
                     self.exit_for_update = True
                     return
                 await asyncio.sleep(60)
@@ -483,9 +497,15 @@ def main(argv=None) -> int:
     log = make_logger(home)
     version = read_version()
     app = App(home, version, log)
+    guard.record_start(home, version)
+    guard.start_heartbeat(home)
+    rb = guard.rolled_back_info(home)
+    if rb:
+        log(f"update_rolled_back: {rb.get('from')} -> {rb.get('to')} (pinned; {rb.get('from')} is not offered again)")
     port = app.serve(int(os.environ.get("YC_PORT") or PORT))
     log(f"Youssef Connector {version} status page http://127.0.0.1:{port}/")
-    if "--no-update" not in argv and update.try_update(version, home, log):
+    if "--no-update" not in argv and app.try_update():
+        guard.mark_clean(home)
         return 0     # the installer closes/replaces files and relaunches the new version
     if not app.configured():
         with contextlib.suppress(Exception):
@@ -497,6 +517,7 @@ def main(argv=None) -> int:
     except Exception:  # noqa: BLE001
         log("fatal: " + traceback.format_exc())
         return 1
+    guard.mark_clean(home)
     return 0
 
 
