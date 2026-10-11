@@ -91,3 +91,18 @@ def test_e2e_fake_adapters(tmp_path, monkeypatch, capsys):
     out = tmp_path / "e2e.txt"
     assert cm.main(["--e2e", "--selftest-out", str(out)]) == 0
     assert "E2E OK ended=agent_end" in out.read_text()
+
+
+def test_selftest_runs_clean(tmp_path, monkeypatch):
+    monkeypatch.setenv("YC_HOME", str(tmp_path))
+    out = tmp_path / "selftest.txt"
+    try:
+        assert cm.main(["--selftest", "--selftest-out", str(out)]) == 0
+    finally:
+        import faulthandler
+        faulthandler.disable()
+        cm._crash_fh.close()
+    text = out.read_text()
+    for step in ("imports", "crash-log", "com-init", "vad-model", "fake-audio-loop"):
+        assert f"PASS {step}" in text, text
+    assert "SELFTEST OK" in text
