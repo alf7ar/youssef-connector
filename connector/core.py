@@ -20,6 +20,15 @@ import soxr
 import websockets
 from websockets.asyncio.client import connect
 
+def _reason_texts(reason) -> tuple:
+    """(ar, en) of a readiness reason (connector/readiness.py has the texts; plain fallback when it cannot be imported)."""
+    try:
+        from . import readiness
+        return readiness.reason_texts(reason)
+    except Exception:  # noqa: BLE001
+        return "فحص الجاهزية فشل. لو استمر اقفل البرنامج وافتحه تاني.", "The readiness check failed. Restart the app if it persists."
+
+
 CONNECTOR_VERSION = "1.0.0"
 HB_EVERY = 10.0          # s between heartbeats
 DIAL_WINDOW = 90.0       # s from dial to answered before no_answer (as dialer/native/calls.py)
@@ -230,12 +239,18 @@ class Connector:
             if call is not None and call.reason is None:   # control lost mid-call: do not leave a live call dangling
                 call.finish("audio_error")
 
+    async def send_logs(self, text: str) -> bool:
+        """The "send logs" action: one {"type": "logs", "text"} message on the authenticated control socket (False when offline)."""
+        return await self._send({"type": "logs", "text": text}) if self._ws is not None else False
+
     async def _hb_loop(self, ws):
         while True:
             try:
                 ready = await asyncio.to_thread(self.phone.ready)
             except Exception as e:
-                ready = {"ok": False, "reason": f"ready() failed: {e!r}"}
+                reason = f"ready() failed: {e!r}"
+                ar, en = _reason_texts(reason)
+                ready = {"ok": False, "reason": reason, "reason_ar": ar, "reason_en": en, "warnings": []}
             if not await self._send({"type": "hb", "ready": ready}, ws):
                 return
             await self.clock.sleep(HB_EVERY)
