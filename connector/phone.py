@@ -24,6 +24,7 @@ except Exception:  # noqa: BLE001
     Radio = None
 
 MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
+_app_log = lambda *a, **k: None   # win_adapters.build() sets the app logger (no print: the frozen exe has no stdout)
 
 
 def mac_int(mac: str) -> int:
@@ -76,7 +77,7 @@ async def find_iphone_mac() -> str:
         msg = f"{type(e).__name__}: {e}"[:200]
         if _find_err[0] != msg:
             _find_err[0] = msg
-            print("find_iphone_mac failed:", msg, flush=True)
+            _app_log("find_iphone_mac failed:", msg)
     return first
 
 
