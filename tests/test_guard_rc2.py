@@ -93,14 +93,15 @@ def test_heartbeat_marks_the_run_clean_when_windows_is_shutting_down(tmp_path, m
     flag = {"down": False}
     stop = guard.start_heartbeat(home, is_shutting_down=lambda: flag["down"])
     time.sleep(0.1)
-    assert guard._read(home / "guard.json")["clean"] is False
+    assert not guard._read(home / "guard.json").get("clean")       # .get: on Windows a read can hit os.replace and see {}
     flag["down"] = True
     for _ in range(100):
-        if guard._read(home / "guard.json")["clean"]:
+        if guard._read(home / "guard.json").get("clean"):
             break
         time.sleep(0.02)
     stop.set()
-    assert guard._read(home / "guard.json")["clean"] is True
+    time.sleep(0.1)
+    assert guard._read(home / "guard.json").get("clean") is True
     assert guard.pending_deaths(guard._read(home / "guard.json"), "0.1.2", time.time() + 5) == 0
 
 
