@@ -322,6 +322,17 @@ class App:
             if rb:
                 ready_orig = phone.ready
                 phone.ready = lambda: {**ready_orig(), "update_rolled_back": rb}
+            from . import eventwatch
+            ready_ev = phone.ready
+
+            def ready_with_events():
+                r = ready_ev()
+                ev = eventwatch.status()["events"]
+                if ev and isinstance(r, dict):
+                    r = {**r, "heal": {**(r.get("heal") if isinstance(r.get("heal"), dict) else {}), "events": ev}}
+                return r
+            phone.ready = ready_with_events
+            eventwatch.start(log=lambda *a: self.log(*a))
             self.conn = core.Connector(ws_base(self.cfg["url"]), self.cfg["token"], phone, audio, gate,
                                        audio_route=route, version=self.version, log=lambda *a: self.log(*a))
             task = asyncio.create_task(self.conn.run())
@@ -329,6 +340,7 @@ class App:
                 await asyncio.sleep(0.5)
                 await self._update_due(check_updates)
             if self.stop_event.is_set():
+                eventwatch.stop()
                 self.conn.stop()
                 task.cancel()
                 with contextlib.suppress(BaseException):
@@ -445,7 +457,7 @@ def selftest(out: Path = None) -> int:
 
     def imports():
         import numpy, onnxruntime, soxr, websockets  # noqa: F401,E401
-        mods = ["core", "fakes", "vad", "update", "readiness", "micguard", "comstress"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
+        mods = ["core", "fakes", "vad", "update", "readiness", "micguard", "comstress", "eventwatch"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
         for m in mods:
             importlib.import_module(f"{__package__ or 'connector'}.{m}")
         return f"version {read_version()}, {len(mods)} connector modules"
