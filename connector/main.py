@@ -598,7 +598,8 @@ def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # a crash of the previous run: faulthandler text in crash.log, or guard.json recorded a fast death (begin() ran already)
     crashed = logsend.crash_pending(app_home()) or int(guard._read(app_home() / "guard.json").get("fd") or 0) > 0
-    enable_crash_log(app_home())
+    if "--supervise" not in argv:   # the supervisor's own header would hide the previous child's crash from the next child
+        enable_crash_log(app_home())
     out = Path(argv[argv.index("--selftest-out") + 1]) if "--selftest-out" in argv else None
     if "--version" in argv:
         print(read_version())

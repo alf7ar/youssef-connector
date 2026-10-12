@@ -108,6 +108,15 @@ def test_main_dispatches_supervise_before_the_app_mutex(tmp_path, monkeypatch):
     assert seen["argv"] == ["--supervise", "--no-update"] and seen["home"] == tmp_path and seen["stop"] is cm.SUPERVISOR_STOP
 
 
+
+def test_supervisor_writes_no_crash_log_header(tmp_path, monkeypatch):
+    """The child's crash_pending() must see the previous run's section, not an empty supervisor header."""
+    monkeypatch.setenv("YC_HOME", str(tmp_path))
+    (tmp_path / "crash.log").write_text("\n=== run 2026-01-01 00:00:00 pid 1 ===\nFatal Python error\n", encoding="utf-8")
+    monkeypatch.setattr(supervisor, "main", lambda argv, home, ver, log, stop: 0)
+    assert cm.main(["--supervise"]) == 0
+    assert cm.logsend.crash_pending(tmp_path)
+
 def test_exit_codes_only_distinct_under_supervision(monkeypatch):
     monkeypatch.delenv("YC_SUPERVISED", raising=False)
     assert cm.exit_code(cm.EXIT_UPDATE) == 0 and cm.exit_code(cm.EXIT_REPLACED) == 0
