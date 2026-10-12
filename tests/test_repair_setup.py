@@ -1,5 +1,6 @@
 """Elevated repair task, installer side: --install-repair/--uninstall-repair dispatch, the PowerShell command, the Inno hooks,
 and static + (when pwsh exists) live FAKE-mode checks of repair.ps1. Real registration/ACLs are exercised in Windows CI."""
+import base64
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from connector import repair_setup as rs  # noqa: E402
 
 REPAIR = (ROOT / "connector" / "repair.ps1").read_text(encoding="utf-8")
 INSTALL = (ROOT / "connector" / "repair_install.ps1").read_text(encoding="utf-8")
+UNINSTALL = (ROOT / "connector" / "repair_uninstall.ps1").read_text(encoding="utf-8")
 ISS = (ROOT / "packaging" / "YoussefConnector.iss").read_text(encoding="utf-8")
 
 
@@ -47,7 +49,12 @@ def test_run_maps_rc_and_writes_output(tmp_path, monkeypatch):
     assert rs.run("install", out, runner=runner) == 0
     assert "installed" in out.read_text(encoding="utf-8") and seen["capture_output"] and seen["timeout"] == rs.TIMEOUT
     assert "creationflags" in seen
-    assert not any(k.upper() == "PSMODULEPATH" for k in seen["env"]) and "PATH" in {k.upper() for k in seen["env"]}
+    monkeypatch.setenv("Path", "C:\\Users\\tester\\bin")
+    assert rs.run("install", out, runner=runner) == 0
+    env = seen["env"]
+    assert [k for k in env if k.upper() == "PSMODULEPATH"] == ["PSModulePath"] and [k for k in env if k.upper() == "PATH"] == ["PATH"]
+    assert env["PATH"] == rs.system_dir()
+    assert env["PSModulePath"].replace("/", "\\").lower().endswith("\\windowspowershell\\v1.0\\modules")
     assert rs.run("uninstall", out, runner=lambda c, **k: R(5, "", "boom")) == 1
     assert "rc=5" in out.read_text(encoding="utf-8") and "boom" in out.read_text(encoding="utf-8")
 
@@ -85,14 +92,49 @@ def test_iss_hooks():
     assert "Pos('youssef-repair-version: {#RepairVer} #'" in ISS
     assert "ShellExec('runas', ExpandConstant('{app}\\{#AppExe}'), Flag" in ISS
     assert "(CurStep = ssPostInstall) and (not WizardSilent) and (not RepairCurrent())" in ISS   # auto-update never prompts
-    assert "RunRepairSetup('--install-repair')" in ISS and "RunRepairSetup('--uninstall-repair')" in ISS
+    assert "RunRepairSetup('--install-repair')" in ISS and "RunRepairSetup('--uninstall-repair')" not in ISS
     assert "CurUninstallStep = usUninstall" in ISS
+    # Program Files (Users cannot create it), never ProgramData
+    assert "ExpandConstant('{commonpf}\\YoussefConnector\\repair\\repair.ps1')" in ISS
+    assert "DirExists(ExpandConstant('{commonpf}\\YoussefConnector'))" in ISS
+    assert "commonappdata" not in ISS and re.search(r"^ArchitecturesInstallIn64BitMode=x64compatible$", ISS, re.M)
+    # uninstall elevates only System32 powershell.exe with the fixed encoded command
+    assert ("ShellExec('runas', ExpandConstant('{sys}\\WindowsPowerShell\\v1.0\\powershell.exe'),\n"
+            "                 '-NoProfile -NonInteractive -EncodedCommand ' + RepairUninstallCmd()") in ISS
+
+
+def uninstall_code(text=UNINSTALL):
+    return "\n".join(ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#"))
+
+
+def iss_encoded():
+    block = ISS[ISS.index("function RepairUninstallCmd(): String;"):ISS.index("{ END-REPAIR-UNINSTALL }")]
+    return "".join(re.findall(r"^    '([A-Za-z0-9+/=]+)'", block, re.M))
+
+
+def test_iss_encoded_uninstall_matches_script():
+    assert base64.b64decode(iss_encoded()).decode("utf-16-le") == uninstall_code()
+    assert len(uninstall_code().splitlines()) <= 40
+
+
+def test_uninstall_script_static():
+    code = uninstall_code()
+    assert "OpenBaseKey('LocalMachine', 'Registry64')" in code and "GetValue('ProgramFilesDir')" in code
+    assert "$env:" not in code.replace("$env:PSModulePath =", "").replace("$env:PATH =", "")   # reads no environment
+    assert code.index("$env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')") < code.index("New-Object")
+    # known names only, non-recursive, and only inside folders that pass the ours check
+    assert "foreach ($f in 'repair.ps1', 'last.json', 'last.json.tmp') { [IO.File]::Delete((Join-Path $dir $f)) }" in code
+    assert "[IO.Directory]::Delete($dir, $false)" in code and "[IO.Directory]::Delete($base, $false)" in code
+    assert code.index("if (-not (Ours $base))") < code.index("if (-not (Ours $dir))") < code.index("[IO.File]::Delete(")
+    for bad in ("Remove-Item", "rmdir", "-Recurse", "Delete($dir, $true)", "Delete($base, $true)", "cmd.exe", "icacls"):
+        assert bad not in UNINSTALL and bad not in INSTALL, bad
+    assert "S-1-5-32-544', 'S-1-5-18'" in code and "AreAccessRulesProtected" in code and "ReparsePoint" in code
 
 
 def test_repair_script_static():
     assert "Get-PnpDevice -Class Bluetooth -PresentOnly" in REPAIR
     assert "-match '^(USB|PCI)\\\\'" in REPAIR
-    assert "pnputil.exe /restart-device" in REPAIR and "Disable-PnpDevice" in REPAIR and "Enable-PnpDevice" in REPAIR
+    assert "/restart-device" in REPAIR and "Disable-PnpDevice" in REPAIR and "Enable-PnpDevice" in REPAIR
     assert "Restart-Svc 'bthserv'" in REPAIR and "Restart-Svc 'BTAGService'" in REPAIR
     assert not re.search(r"VID_[0-9A-F]{4}|PID_[0-9A-F]{4}|VEN_[0-9A-F]{4}|DEV_[0-9A-F]{4}", REPAIR, re.I)   # no device IDs
     # the output folder can only move in FAKE mode; the SYSTEM task always writes next to the script
@@ -110,10 +152,43 @@ def test_install_script_static():
     assert "$TaskName = 'YoussefRepair'" in INSTALL
     assert """$TaskArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + $Script + '"'""" in INSTALL
     assert "$def.Principal.RunLevel = 1" in INSTALL and "$def.Principal.LogonType = 5" in INSTALL
-    assert "SetAccessRuleProtection($true, $false)" in INSTALL
+    assert "SetAccessRuleProtection($true, $false)" in INSTALL and "$acl.SetOwner($SidAdmins)" in INSTALL
     code = "\n".join(ln for ln in INSTALL.splitlines() if not ln.lstrip().startswith("#"))
-    assert "GetFolderPath('CommonApplicationData')" in code and "$env:ProgramData" not in code
-    assert "Triggers" not in INSTALL
+    assert "OpenBaseKey('LocalMachine', 'Registry64')" in code and "GetValue('ProgramFilesDir')" in code
+    assert "ProgramData" not in code and "CommonApplicationData" not in code
+    assert "Triggers.Create" not in INSTALL and "$t.Definition.Triggers.Count -ne 0" in code
+    # env reset before the first cmdlet (New-Object) can autoload a module
+    assert code.index("$env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')") < code.index("New-Object")
+    assert "$env:PATH = [Environment]::SystemDirectory" in code
+    # never adopt: a folder that is not ours is renamed aside; new folders/files get their DACL at creation
+    assert "if ((Test-There $Base) -and -not (Test-Ours $Base)) { Move-Aside $Base }" in code
+    assert "[IO.Directory]::CreateDirectory($p, (New-Acl $true))" in code
+    assert "[IO.FileMode]::CreateNew" in code and "(New-Acl $false))" in code
+    # task: deleted first, then TASK_CREATE with the SDDL in the same call; action verified exactly
+    assert code.index("Remove-RepairTask\n") < code.index("RegisterTaskDefinition(")
+    assert "RegisterTaskDefinition($TaskName, $def, 2, 'SYSTEM', $null, 5, $TaskSddl)" in code
+    assert "SetSecurityDescriptor" not in code and ", 6, 'SYSTEM'" not in code
+    assert "$a.Path -ne $PowerShellExe -or $a.Arguments -ne $TaskArgs" in code
+    # uninstall + rollback share repair_uninstall.ps1
+    assert "$Uninstaller = Join-Path $PSScriptRoot 'repair_uninstall.ps1'" in code and code.count("& $Uninstaller") == 2
+
+
+def test_repair_script_uses_absolute_pnputil():
+    assert "$pnputil = [IO.Path]::Combine([Environment]::SystemDirectory, 'pnputil.exe')" in REPAIR
+    assert "& $pnputil /restart-device" in REPAIR and "& pnputil" not in REPAIR
+
+
+@pytest.mark.skipif(not shutil.which("pwsh"), reason="pwsh not installed")
+def test_ps1_files_parse(tmp_path):
+    enc = tmp_path / "encoded.ps1"
+    enc.write_text(base64.b64decode(iss_encoded()).decode("utf-16-le"), encoding="utf-8")
+    files = [ROOT / "connector" / n for n in ("repair.ps1", "repair_install.ps1", "repair_uninstall.ps1")] + [enc]
+    ps = ("$bad = 0; foreach ($f in $env:PS_FILES.Split('|')) { $e = $null; $null = [System.Management.Automation.Language.Parser]::"
+          "ParseFile($f, [ref]$null, [ref]$e); foreach ($x in $e) { $bad++; Write-Output \"$f $($x.Extent.StartLineNumber): "
+          "$($x.Message)\" } }; exit $bad")
+    env = dict(os.environ, PS_FILES="|".join(map(str, files)))
+    r = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", ps], env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
 
 
 @pytest.mark.skipif(not shutil.which("pwsh"), reason="pwsh not installed")

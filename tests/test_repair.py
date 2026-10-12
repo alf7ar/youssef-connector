@@ -142,9 +142,12 @@ def test_schtasks_uses_no_window(monkeypatch):
     assert got["kw"]["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def test_last_json_path_uses_programdata(monkeypatch):
-    monkeypatch.setenv("PROGRAMDATA", "X")
-    assert repair.last_json_path().parts[-3:] == ("YoussefConnector", "repair", "last.json")
+def test_last_json_path_uses_program_files(monkeypatch):
+    monkeypatch.delenv("ProgramW6432", raising=False)
+    monkeypatch.setenv("ProgramFiles", "X")
+    assert repair.last_json_path().parts == ("X", "YoussefConnector", "repair", "last.json")
+    monkeypatch.setenv("ProgramW6432", "Y")
+    assert repair.last_json_path().parts[0] == "Y"
 
 
 def test_register_with_heal(monkeypatch):

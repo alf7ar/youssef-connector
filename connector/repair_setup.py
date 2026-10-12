@@ -41,9 +41,11 @@ def command(mode: str) -> list:
 
 def run(mode: str, out=None, runner=subprocess.run) -> int:
     """Run repair_install.ps1; its output goes to `out` (windowed exe: no console). -> 0 ok, 1 failed."""
-    # PowerShell 7 module paths inherited from a pwsh parent make Windows PowerShell fail to load its own core modules
-    # (Get-Acl, Get-FileHash ...): let powershell.exe rebuild the default PSModulePath
-    env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+    # The elevated process must not use the (possibly other) user's PATH or PSModulePath (user module folders, pwsh 7 paths
+    # that break Windows PowerShell's core modules): System32 only, modules only from Windows PowerShell's own folder.
+    env = {k: v for k, v in os.environ.items() if k.upper() not in ("PSMODULEPATH", "PATH")}
+    env["PATH"] = system_dir()
+    env["PSModulePath"] = os.path.join(system_dir(), "WindowsPowerShell", "v1.0", "Modules")
     try:
         r = runner(command(mode), capture_output=True, text=True, timeout=TIMEOUT, env=env,
                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))

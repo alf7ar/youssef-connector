@@ -68,13 +68,13 @@ jobs:
           if (-not $done) { throw 'built exe --selftest exceeded 60 s' }
           if ($p.ExitCode -ne 0) { throw "built exe selftest exit code $($p.ExitCode)" }
 
-      - name: "Elevated repair task (built exe --install-repair: SYSTEM task, ACLs, task SD, fake + SYSTEM + standard-user runs, --uninstall-repair)"
+      - name: "Elevated repair task (built exe --install-repair: Program Files, foreign folder/task not adopted, owner, ACLs, task SD + action, fake + SYSTEM + standard-user runs, --uninstall-repair)"
         shell: pwsh
         timeout-minutes: 8
         run: |
           $exe = 'dist\YoussefConnector\YoussefConnector.exe'
           $out = Join-Path $env:RUNNER_TEMP 'repair-setup.txt'
-          $base = Join-Path $env:ProgramData 'YoussefConnector'
+          $base = Join-Path $env:ProgramFiles 'YoussefConnector'
           $dir = Join-Path $base 'repair'
           $ps1 = Join-Path $dir 'repair.ps1'
           $lj = Join-Path $dir 'last.json'
@@ -82,16 +82,22 @@ jobs:
           $admin = @('S-1-5-18', 'S-1-5-32-544')
           $write = [Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteExtendedAttributes, WriteAttributes, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
           $rx = [Security.AccessControl.FileSystemRights]::ReadAndExecute
-          function Setup($flag) {
+          function Setup($flag, $want = 0) {
             $p = Start-Process -FilePath $exe -ArgumentList $flag, '--selftest-out', $out -Wait -PassThru
             if (Test-Path $out) { Get-Content $out } else { Write-Host 'NO SETUP OUTPUT' }
-            if ($p.ExitCode -ne 0) { throw "$flag exit code $($p.ExitCode)" }
+            if ($p.ExitCode -ne $want) { throw "$flag exit code $($p.ExitCode), expected $want" }
           }
           function Assert-Acl($path, $protected) {
             $acl = Get-Acl -LiteralPath $path
             $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
             $rules | ForEach-Object { Write-Host "  $path $($_.IdentityReference) $($_.AccessControlType) $($_.FileSystemRights) inherited=$($_.IsInherited)" }
             if ($protected -and -not $acl.AreAccessRulesProtected) { throw "$path inherits ACEs" }
+            if ($protected) {
+              $own = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+              Write-Host "  $path owner $own"
+              if ($own -notin $admin) { throw "$path owner is $own" }
+              if ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$path is a reparse point" }
+            }
             $bad = @($rules | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -notin $admin -and ($_.FileSystemRights -band $write) })
             if ($bad.Count) { throw "$path grants write to $($bad.IdentityReference.Value -join ',')" }
             $ok = @($rules | Where-Object { $_.IdentityReference -eq $users -and $_.AccessControlType -eq 'Allow' -and (($_.FileSystemRights -band $rx) -eq $rx) })
@@ -108,12 +114,22 @@ jobs:
           }
 
           if (Get-ScheduledTask -TaskName YoussefRepair -ErrorAction SilentlyContinue) { throw 'task exists before install' }
+          if (Test-Path $base) { throw "$base exists before install" }
+          # planted beforehand: a folder with an inherited (Program Files) DACL and a same-named task with another action.
+          # The install must rename the folder aside (never adopt it) and replace the task (never update it in place).
+          New-Item -ItemType Directory -Force (Join-Path $dir 'planted') | Out-Null
+          Set-Content -LiteralPath $ps1 -Value 'planted'
+          Register-ScheduledTask -TaskName YoussefRepair -Action (New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" -Argument '/c exit 7') -User 'SYSTEM' -Force | Out-Null
           Setup '--install-repair'
+          $aside = @(Get-ChildItem -LiteralPath $env:ProgramFiles -Directory -Filter 'YoussefConnector.foreign-*')
+          if ($aside.Count -ne 1 -or -not (Test-Path (Join-Path $aside[0].FullName 'repair\planted'))) { throw 'planted folder was not moved aside' }
+          if (Test-Path (Join-Path $dir 'planted')) { throw 'planted folder was adopted' }
+          Remove-Item -LiteralPath $aside[0].FullName -Recurse -Force
           $t = Get-ScheduledTask -TaskName YoussefRepair
           $trig = @($t.Triggers | Where-Object { $null -ne $_ })
           Write-Host "principal $($t.Principal.UserId) $($t.Principal.LogonType) $($t.Principal.RunLevel); action $($t.Actions[0].Execute) $($t.Actions[0].Arguments); triggers $($trig.Count)"
           if ($t.Principal.UserId -notin @('SYSTEM', 'S-1-5-18') -or "$($t.Principal.RunLevel)" -ne 'Highest') { throw 'task principal is not SYSTEM / Highest' }
-          if (@($t.Actions).Count -ne 1 -or $t.Actions[0].Arguments -ne ('-NoProfile -ExecutionPolicy Bypass -File "' + $ps1 + '"') -or $t.Actions[0].Execute -notlike '*\WindowsPowerShell\v1.0\powershell.exe') { throw 'unexpected task action' }
+          if (@($t.Actions).Count -ne 1 -or $t.Actions[0].Arguments -ne ('-NoProfile -ExecutionPolicy Bypass -File "' + $ps1 + '"') -or $t.Actions[0].Execute -ne "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe") { throw 'unexpected task action' }
           if ($trig.Count) { throw 'task has triggers' }
           $svc = New-Object -ComObject Schedule.Service; $svc.Connect()
           $sd = $svc.GetFolder('\').GetTask('YoussefRepair').GetSecurityDescriptor(4)
@@ -169,8 +185,19 @@ jobs:
           if (Get-ScheduledTask -TaskName YoussefRepair -ErrorAction SilentlyContinue) { throw 'task still present after --uninstall-repair' }
           if (Test-Path $base) { throw "$base still present after --uninstall-repair" }
           Setup '--uninstall-repair'   # idempotent
+          # a folder that is not ours is left alone by uninstall (exit 1), contents untouched
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Set-Content -LiteralPath $ps1 -Value 'foreign'
+          Setup '--uninstall-repair' 1
+          if ((Get-Content -LiteralPath $ps1) -ne 'foreign') { throw 'uninstall touched a foreign folder' }
+          Remove-Item -LiteralPath $base -Recurse -Force
+          if (Test-Path (Join-Path $env:ProgramData 'YoussefConnector')) { throw 'ProgramData\YoussefConnector was created' }
           Setup '--install-repair'     # left installed: the Inno uninstaller must remove it (checked in the Uninstall step)
           if (-not (Get-ScheduledTask -TaskName YoussefRepair -ErrorAction SilentlyContinue)) { throw 'reinstall failed' }
+          Setup '--install-repair'     # upgrade path: our folder + our task already there (known names deleted, task recreated)
+          if (-not (Get-ScheduledTask -TaskName YoussefRepair -ErrorAction SilentlyContinue)) { throw 'upgrade reinstall failed' }
+          if (@(Get-ChildItem -LiteralPath $env:ProgramFiles -Directory -Filter 'YoussefConnector*').Count -ne 1) { throw 'upgrade left a folder aside' }
+          foreach ($p in @($base, $dir, $ps1)) { Assert-Acl $p $true }
 
       - name: Inno Setup compile
         shell: pwsh
@@ -236,7 +263,7 @@ jobs:
           Start-Sleep 3
           if (Test-Path "$dir\YoussefConnector.exe") { throw 'uninstall left the exe behind' }
           if (Get-ScheduledTask -TaskName YoussefRepair -ErrorAction SilentlyContinue) { throw 'uninstall left the YoussefRepair task behind' }
-          if (Test-Path "$env:ProgramData\YoussefConnector") { throw 'uninstall left ProgramData\YoussefConnector behind' }
+          if (Test-Path "$env:ProgramFiles\YoussefConnector") { throw 'uninstall left Program Files\YoussefConnector behind' }
           Write-Host 'uninstalled (app, repair task, repair folder)'
 
       - uses: actions/upload-artifact@v4

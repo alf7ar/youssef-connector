@@ -1,6 +1,6 @@
 # youssef-repair-version: 1 #
 # Youssef Connector Bluetooth repair. Installed by `YoussefConnector.exe --install-repair` (elevated, once) as
-# %ProgramData%\YoussefConnector\repair\repair.ps1 and run ONLY by the SYSTEM scheduled task "YoussefRepair" (no arguments;
+# %ProgramFiles%\YoussefConnector\repair\repair.ps1 and run ONLY by the SYSTEM scheduled task "YoussefRepair" (no arguments;
 # the app starts it with `schtasks /run /tn YoussefRepair`). Steps: restart every present USB/PCI Bluetooth adapter
 # (pnputil /restart-device, fallback Disable/Enable-PnpDevice), restart the services bthserv and BTAGService, then write
 # last.json {time, epoch, steps, rc, ...} next to this script (Users can read it through the folder ACL).
@@ -14,6 +14,7 @@ if ($fake -and $env:YOUSSEF_REPAIR_OUT) { $outDir = $env:YOUSSEF_REPAIR_OUT }
 $steps = New-Object System.Collections.ArrayList
 $script:rc = 0
 $t0 = Get-Date
+$pnputil = [IO.Path]::Combine([Environment]::SystemDirectory, 'pnputil.exe')   # absolute: no PATH lookup as SYSTEM
 
 function Add-Step([string]$name, [bool]$ok, [string]$detail) {
     [void]$steps.Add([ordered]@{ step = $name; ok = $ok; detail = $detail })
@@ -22,7 +23,7 @@ function Add-Step([string]$name, [bool]$ok, [string]$detail) {
 
 function Restart-Adapter([string]$id) {
     if ($fake) { Add-Step 'restart_device' $true "fake: skipped $id"; return }
-    $out = & pnputil.exe /restart-device "$id" 2>&1 | Out-String
+    $out = & $pnputil /restart-device "$id" 2>&1 | Out-String
     $code = $LASTEXITCODE
     if ($code -eq 0 -or $code -eq 3010) {
         Add-Step 'restart_device' $true "pnputil rc=$code $id"
