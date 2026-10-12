@@ -44,7 +44,8 @@ class MockCall:
 
 
 class MockHub:
-    def __init__(self, token="tok", min_version="0.0.0", auto_ack=True, on_call=None, welcome=True):
+    def __init__(self, token="tok", min_version="0.0.0", auto_ack=True, on_call=None, welcome=True, config=None):
+        self.config = config
         self.token, self.min_version, self.auto_ack, self.on_call, self.welcome = token, min_version, auto_ack, on_call, welcome
         self.server = None
         self.port = None
@@ -52,6 +53,7 @@ class MockHub:
         self.msgs = []                 # (type, msg, t) from the connector's control socket
         self.log = []                  # ordered events: ctl:<type>, ack_sent, call_open, audio, call_rejected, call_closed
         self.calls = {}                # call_id -> MockCall
+        self.hosts_seen = []           # Host header of every websocket upgrade
         self.headers_seen = []         # X-Connector-Token values seen (control + call sockets)
         self.early_call_attempts = 0
         self.acked = set()
@@ -75,6 +77,7 @@ class MockHub:
         path = ws.request.path
         tok = ws.request.headers.get("X-Connector-Token")
         self.headers_seen.append(tok)
+        self.hosts_seen.append(ws.request.headers.get("Host"))
         if tok != self.token:
             await ws.close(4401)
             return
@@ -95,7 +98,10 @@ class MockHub:
                 t = msg.get("type")
                 self.log.append((f"ctl:{t}", msg.get("call_id")))
                 if t == "hello" and self.welcome:
-                    await ws.send(json.dumps({"type": "welcome", "min_version": self.min_version}))
+                    w = {"type": "welcome", "min_version": self.min_version}
+                    if self.config is not None:
+                        w["config"] = self.config
+                    await ws.send(json.dumps(w))
                 async with self._cond:
                     self.msgs.append((t, msg, time.monotonic()))
                     self._cond.notify_all()

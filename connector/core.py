@@ -13,9 +13,13 @@ has the fakes used by tests. Policy notes:
 import asyncio
 import collections
 import json
+import os
+import random
 import socket
 import time
+from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import numpy as np
 import soxr
@@ -52,7 +56,43 @@ REPLACED_WINDOW = 600.0
 TOKEN_RETRY = 300.0      # s between reconnects while the hub rejects the token (4401)
 REASONS = {"callee_hangup", "call_ended", "no_answer", "busy", "no_speech", "dial_failed", "audio_error",
            "hangup_cmd", "agent_end"}
+DNS_JITTER = (0.5, 1.5)  # backoff multiplier range after a DNS failure (so a fleet does not retry in lockstep)
 _ABORT = object()
+
+
+def _is_dns_error(e: BaseException) -> bool:
+    """True when `e` is (or was caused by) a name-resolution failure (socket.gaierror)."""
+    seen = 0
+    while e is not None and seen < 5:
+        if isinstance(e, socket.gaierror):
+            return True
+        e = e.__cause__ or e.__context__
+        seen += 1
+    return False
+
+
+def _heal_report(failure: str, **detail):
+    """Tell the self-heal module (connector/heal.py, optional) about a failure; never raises."""
+    try:
+        from . import heal
+        heal.report(failure, **detail)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _write_json_atomic(path: Path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _read_json_dict(path: Path) -> dict:
+    try:
+        d = json.loads(path.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def _vtuple(v: str):
@@ -185,7 +225,7 @@ class _Call:
 class Connector:
     def __init__(self, base_url: str, token: str, phone: PhoneAdapter, audio: AudioAdapter, gate: AnswerGate,
                  clock: Optional[Clock] = None, host: Optional[str] = None, audio_route: str = "hf_direct",
-                 version: str = CONNECTOR_VERSION, log=None):
+                 version: str = CONNECTOR_VERSION, log=None, home=None):
         self.base = base_url.rstrip("/")
         self.headers = {"X-Connector-Token": token}
         self.phone, self.audio, self.gate = phone, audio, gate
@@ -203,6 +243,81 @@ class Connector:
         self.token_rejected = False                # the hub closed with 4401 (bad / rotated token); cleared by the next welcome
         self.last_ready: Optional[dict] = None     # the ready dict of the latest heartbeat (keep-awake reads it)
         self._replaced_at: list = []
+        self.home = Path(home) if home else None
+        # Server-pushed config (welcome["config"]): persisted to HOME/remote_config.json, loaded at start, handed to on_config callbacks.
+        self.remote_config: dict = _read_json_dict(self.home / "remote_config.json") if self.home else {}
+        self._config_cbs: list = []
+        # Last good resolved IP per hostname (HOME/dns_cache.json): used only when name resolution fails.
+        self._dns_cache: dict = _read_json_dict(self.home / "dns_cache.json") if self.home else {}
+        self._last_dns_fail = False
+
+    def on_config(self, fn, replay: bool = True):
+        """Register fn(config: dict), called on every welcome that carries a config. With replay (default) a config loaded from
+        disk is delivered right away, so callbacks need no special start-up path."""
+        self._config_cbs.append(fn)
+        if replay and self.remote_config:
+            self._call_config_cb(fn, self.remote_config)
+
+    def _call_config_cb(self, fn, cfg: dict):
+        try:
+            fn(dict(cfg))
+        except Exception as e:  # noqa: BLE001
+            self.log("on_config callback failed:", repr(e))
+
+    def _apply_config(self, cfg):
+        if not isinstance(cfg, dict):
+            return
+        changed = cfg != self.remote_config
+        self.remote_config = dict(cfg)
+        if changed and self.home:
+            try:
+                _write_json_atomic(self.home / "remote_config.json", self.remote_config)
+            except OSError as e:
+                self.log("remote_config persist failed:", repr(e))
+        for fn in list(self._config_cbs):
+            self._call_config_cb(fn, self.remote_config)
+
+    # ---- websocket open with DNS fallback ---------------------------------------------------------------------------
+    async def _open(self, url: str, **kw):
+        """Open a websocket (`async with await self._open(...) as ws`). Normal path = websockets.connect(url). When the hostname cannot
+        be resolved (gaierror) and a previous connection to that host succeeded, retry once through the remembered IP: TCP goes to
+        the IP while TLS SNI / certificate check / Host header still use the hostname from the URL."""
+        host = urlsplit(url).hostname or ""
+        try:
+            ws = await connect(url, **kw)
+        except OSError as e:
+            if not _is_dns_error(e):
+                raise
+            self._last_dns_fail = True
+            ip = self._dns_cache.get(host)
+            _heal_report("net_dns", host=host, cached_ip=bool(ip))
+            self.log("dns failed for", host, "-", "retrying via last good ip" if ip else "no cached ip")
+            if not ip:
+                raise
+            ws = await connect(url, host=ip, **kw)
+        else:
+            self._remember_ip(host, ws)
+        return ws
+
+    def _remember_ip(self, host: str, ws):
+        try:
+            ip = ws.remote_address[0]
+            socket.inet_pton(socket.AF_INET6 if ":" in ip else socket.AF_INET, ip)   # a real address, not a name
+        except Exception:  # noqa: BLE001
+            return
+        if not host or host == ip or self._dns_cache.get(host) == ip:
+            return
+        try:
+            socket.inet_pton(socket.AF_INET6 if ":" in host else socket.AF_INET, host)
+            return                                                                   # the URL already carries an IP literal
+        except OSError:
+            pass
+        self._dns_cache[host] = ip
+        if self.home:
+            try:
+                _write_json_atomic(self.home / "dns_cache.json", self._dns_cache)
+            except OSError as e:
+                self.log("dns_cache persist failed:", repr(e))
 
     def stop(self):
         self.stopped = True
@@ -215,10 +330,11 @@ class Connector:
             self._welcomed = False
             ws = None
             err = None
+            self._last_dns_fail = False
             try:
-                async with connect(self.base + "/connector/ws", additional_headers=self.headers, open_timeout=10,
-                                   max_size=2 ** 22, ping_interval=WS_PING_INTERVAL, ping_timeout=WS_PING_TIMEOUT,
-                                   close_timeout=WS_CLOSE_TIMEOUT) as ws:
+                async with await self._open(self.base + "/connector/ws", additional_headers=self.headers, open_timeout=10,
+                                            max_size=2 ** 22, ping_interval=WS_PING_INTERVAL, ping_timeout=WS_PING_TIMEOUT,
+                                            close_timeout=WS_CLOSE_TIMEOUT) as ws:
                     await self._session(ws)
             except (OSError, websockets.WebSocketException, asyncio.TimeoutError) as e:
                 err = e
@@ -242,7 +358,10 @@ class Connector:
                 continue
             if self._welcomed:
                 idx = 0
-            await self.clock.sleep(BACKOFF[min(idx, len(BACKOFF) - 1)])
+            delay = BACKOFF[min(idx, len(BACKOFF) - 1)]
+            if self._last_dns_fail and not self._welcomed:
+                delay *= random.uniform(*DNS_JITTER)
+            await self.clock.sleep(delay)
             idx += 1
 
     @staticmethod
@@ -303,6 +422,8 @@ class Connector:
         if t == "welcome":
             self._welcomed = True
             self.token_rejected = False
+            if "config" in m:
+                self._apply_config(m.get("config"))
             if _vtuple(self.version) < _vtuple(m.get("min_version", "0")):
                 self.stop_reason = "outdated"
                 self.stopped = True
@@ -440,10 +561,10 @@ class Connector:
         if call.reason is not None:
             return
         try:
-            async with connect(f"{self.base}/call/{call.id}/ws", additional_headers=self.headers,
-                               open_timeout=ACK_TIMEOUT, max_size=2 ** 22,
-                               ping_interval=WS_PING_INTERVAL, ping_timeout=WS_PING_TIMEOUT,
-                               close_timeout=WS_CLOSE_TIMEOUT) as cws:
+            async with await self._open(f"{self.base}/call/{call.id}/ws", additional_headers=self.headers,
+                                        open_timeout=ACK_TIMEOUT, max_size=2 ** 22,
+                                        ping_interval=WS_PING_INTERVAL, ping_timeout=WS_PING_TIMEOUT,
+                                        close_timeout=WS_CLOSE_TIMEOUT) as cws:
                 call.ws = cws
                 await self._call_socket(call, cws, preroll)
         except (OSError, websockets.WebSocketException, asyncio.TimeoutError) as e:
