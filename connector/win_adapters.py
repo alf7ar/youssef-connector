@@ -37,6 +37,7 @@ win_audio = _sibling("win_audio")
 vad = _sibling("vad")
 readiness = _sibling("readiness")
 _app_log = lambda *a, **k: None   # build(log=...) sets the app logger; never print() (lost in the frozen exe)
+heal = _sibling("heal")
 
 HOME = micguard.HOME                # %LOCALAPPDATA%\YoussefConnector (YOUSSEF_HOME overrides)
 DEFAULTS_BACKUP = HOME / "default-devices.json"   # normal default devices while the cable route has them switched
@@ -139,10 +140,24 @@ class WinPhone(PhoneAdapter):
             return readiness.decorate({"ok": False, "reason": "call_active", "call_active": True})
         return readiness.check(self.mac, self._log)
 
+    def busy(self) -> bool:
+        """A call is up (ours, or one Windows sees on the line, incoming included): the heal engine must not touch Bluetooth."""
+        if self.t_dial is not None and not self.ended:
+            return True
+        try:
+            f = phone.call_flags()
+        except Exception:  # noqa: BLE001
+            return True
+        return f.get("call_active") is not False or bool(f.get("call_incoming"))
+
     def dial(self, number: str) -> bool:
         num = re.sub(r"[\s\-().]", "", str(number))
         if not NUM_RE.match(num):
             self.last_error = "bad number"
+            return False
+        if heal is not None and heal.is_busy():   # a repair action (Bluetooth refresh) is running: dialing now would fail or stall it
+            self.last_error = "a Bluetooth repair is running: try again in a minute"
+            self._log("dial_refused", why="heal_busy")
             return False
         with self.lock:
             self._reset()

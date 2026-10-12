@@ -11,6 +11,7 @@ psutil
 winrt-runtime
 winrt-Windows.ApplicationModel.Calls
 winrt-Windows.Devices.Bluetooth
+winrt-Windows.Devices.Bluetooth.Rfcomm
 winrt-Windows.Devices.Enumeration
 winrt-Windows.Devices.Radios
 winrt-Windows.Foundation

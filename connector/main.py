@@ -30,7 +30,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import guard, logsend, power, update
+from . import guard, heal, logsend, power, update
 
 MUTEX = guard.MUTEX
 PORT = 5076
@@ -451,11 +451,15 @@ class App:
             phone, audio, gate, route = build_adapters(cfg=self.cfg, log=self.log)
             self.phone, self.audio_route = phone, route
             rb = guard.rolled_back_info(self.home)
-            if rb:
-                ready_orig = phone.ready
-                phone.ready = lambda: {**ready_orig(), "update_rolled_back": rb}
+            ready_orig = phone.ready
+            phone.ready = heal_ready(ready_orig, rb)
+            busy = getattr(phone, "busy", None)
+            heal.set_in_call(lambda: self.in_call() or bool(busy and busy()))
+            heal.set_policy(self.cfg.get("heal"))
             self.conn = core.Connector(ws_base(self.cfg["url"]), self.cfg["token"], phone, audio, gate,
                                        audio_route=route, version=self.version, log=lambda *a: self.log(*a))
+            if hasattr(self.conn, "on_config"):   # server-pushed config (welcome "config"): its "heal" policy
+                self.conn.on_config(lambda c: heal.set_policy((c or {}).get("heal") if isinstance(c, dict) else None))
             task = asyncio.create_task(self.conn.run())
             while not task.done() and not self.stop_event.is_set():
                 await asyncio.sleep(0.5)
@@ -477,6 +481,43 @@ class App:
                 self.message = "تم تشغيل موصل آخر / Another connector took over"
                 self.replaced = True
                 return
+
+
+HEAL_EVERY = 2.0   # s between heal.tick() calls
+
+
+def heal_ready(ready_orig, rolled_back=None):
+    """The phone.ready wrapper: adds update_rolled_back and the heal status; not ready (heal_busy) while a repair action runs."""
+    def ready():
+        r = {**ready_orig(), **({"update_rolled_back": rolled_back} if rolled_back else {}), "heal": heal.status()}
+        if heal.is_busy():
+            from . import readiness
+            r.update(ok=False, reason="heal_busy")
+            readiness.decorate(r, r.get("warnings") or ())
+        return r
+    return ready
+
+
+def start_heal(app: App, log) -> threading.Thread:
+    """Daemon thread: heal.tick() every HEAL_EVERY s (at most one repair action per tick, never during a call)."""
+    heal.set_log(log)
+    heal.set_in_call(app.in_call)
+    try:   # the Bluetooth repair actions (radio_on, hf_refresh, phone_connect, radio_cycle); without winrt they stay unregistered
+        from . import bt_actions
+        bt_actions.register(heal)
+    except Exception as e:  # noqa: BLE001
+        log("heal_register_failed", f"{type(e).__name__}: {e}"[:200])
+
+    def run():
+        while not app.stop_event.is_set():
+            try:
+                heal.tick()
+            except Exception as e:  # noqa: BLE001
+                log("heal_tick_failed", f"{type(e).__name__}: {e}"[:200])
+            app.stop_event.wait(HEAL_EVERY)
+    t = threading.Thread(target=run, daemon=True, name="heal")
+    t.start()
+    return t
 
 
 def make_logger(home: Path):
@@ -579,7 +620,7 @@ def selftest(out: Path = None) -> int:
 
     def imports():
         import numpy, onnxruntime, soxr, websockets  # noqa: F401,E401
-        mods = ["core", "fakes", "vad", "update", "readiness", "micguard", "comstress", "supervisor"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
+        mods = ["core", "fakes", "vad", "update", "readiness", "heal", "micguard", "comstress", "supervisor"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
         for m in mods:
             importlib.import_module(f"{__package__ or 'connector'}.{m}")
         return f"version {read_version()}, {len(mods)} connector modules"
@@ -712,6 +753,8 @@ def main(argv=None) -> int:
         log(f"update_rolled_back: {rb.get('from')} -> {rb.get('to')} (pinned; {rb.get('from')} is not offered again)")
     port = app.serve(int(os.environ.get("YC_PORT") or PORT))
     log(f"Youssef Connector {version} status page http://127.0.0.1:{port}/")
+    heal.set_policy(app.cfg.get("heal"))
+    start_heal(app, log)
     if "--no-update" not in argv and app.try_update():
         guard.mark_clean(home)
         return exit_code(EXIT_UPDATE)     # the installer closes/replaces files and relaunches the new version

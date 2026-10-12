@@ -30,6 +30,7 @@ def _sibling(name):
 
 
 phone = _sibling("phone")
+heal = _sibling("heal")
 
 RESUME_GAP = 20.0   # s between two 0.5 s watch ticks (wall or monotonic clock) that means the laptop slept
 HF_SETTLE = 30.0    # s after app start / resume before the idle Hands-Free check (let Bluetooth reconnect first)
@@ -51,8 +52,11 @@ REASONS = {
                       "Battery saver is on and throttles Bluetooth. Turn it off or plug in the charger."),
     "phone_link_not_running": ("برنامج Phone Link مش شغال. افتحه من قايمة ابدأ.", "Phone Link is not running. Open it from the Start menu."),
     "bluetooth_off": ("البلوتوث مقفول على اللابتوب. شغّله.", "Bluetooth is off on the laptop. Turn it on."),
+    "bluetooth_adapter_missing": ("مفيش كارت بلوتوث شغال على اللابتوب (مفصول أو متشال). فعّله من Device Manager أو وصّل دونجل.",
+                                  "No Bluetooth adapter is available on the laptop (disabled or absent). Enable it in Device Manager or plug in a dongle."),
     "iphone_not_connected": ("الآيفون مش متوصل بالبلوتوث. شغّل البلوتوث على الآيفون وقرّبه من اللابتوب.",
                              "The iPhone is not connected over Bluetooth. Turn Bluetooth on on the iPhone and bring it close."),
+    "heal_busy": ("بصلّح البلوتوث دلوقتي. استنى شوية وجرّب تاني.", "A Bluetooth repair is running. Wait a moment and try again."),
     "hf_refreshing": ("بجدد خدمة الصوت (Hands-Free) مع الآيفون. هتاخد حوالي دقيقتين.",
                       "Refreshing the iPhone Hands-Free audio service. It takes about two minutes."),
     "hf_endpoints": ("جهازي الصوت بتوع الآيفون (Hands-Free) مش ظاهرين. افصل وصّل البلوتوث.",
@@ -371,6 +375,8 @@ def auto_ready(info: dict, mac: str = "", log=_print_log) -> tuple:
         return False, "phone_link_not_running"
     radio = asyncio.run(phone.bt_radio())
     info["bt_radio"] = radio.get("on")
+    if radio.get("present") is False:   # no Bluetooth radio listed at all: adapter disabled in Device Manager or absent
+        return False, "bluetooth_adapter_missing"
     if radio.get("on") is False:
         return False, "bluetooth_off"
     cfg_mac = mac
@@ -417,6 +423,11 @@ def check(mac: str = "", log=_print_log) -> dict:
         ok, reason = auto_ready(info, mac, log)
     except Exception as e:  # noqa: BLE001
         ok, reason = False, f"ready_check_failed: {type(e).__name__}"
+    if heal is not None and reason in heal.FAILURES:   # the heal engine's ladder for it (never hf_refreshing: a refresh runs)
+        try:
+            heal.report(reason)
+        except Exception:  # noqa: BLE001
+            pass
     warns = []
     if info["call_active"] is False:   # no probes (PowerShell) while a call is up or its state is unknown
         warns = collect_warnings(_phone_name[0])

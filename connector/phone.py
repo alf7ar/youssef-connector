@@ -31,6 +31,12 @@ def mac_int(mac: str) -> int:
     return int(mac.replace(":", ""), 16)
 
 
+def _enum_name(v) -> str:
+    """WinRT enum value -> its upper-case name ("ALLOWED", "DENIED_BY_USER", ...); the number when it has no name."""
+    n = getattr(v, "name", None)
+    return str(n if n else v).rsplit(".", 1)[-1].upper()
+
+
 async def bt_radio(turn_on: bool = False) -> dict:
     """{'present', 'on', 'error'}; turn_on=True switches an off Bluetooth radio on."""
     if Radio is None:
@@ -41,11 +47,13 @@ async def bt_radio(turn_on: bool = False) -> dict:
         if not bt:
             return {"present": False, "on": False, "error": None}
         r = bt[0]
+        out = {"present": True, "on": None, "error": None}
         if turn_on and r.state != RadioState.ON:
-            await Radio.request_access_async()
-            await r.set_state_async(RadioState.ON)
+            out["access"] = _enum_name(await Radio.request_access_async())
+            out["set"] = _enum_name(await r.set_state_async(RadioState.ON))   # always tried, as before ("UNSPECIFIED" can still work)
             await asyncio.sleep(1.5)
-        return {"present": True, "on": r.state == RadioState.ON, "error": None}
+        out["on"] = r.state == RadioState.ON
+        return out
     except Exception as e:  # noqa: BLE001
         return {"present": None, "on": None, "error": f"{type(e).__name__}: {e}"[:200]}
 
@@ -362,6 +370,7 @@ def call_flags() -> dict:
 # Measured 2026-10-10 12:19 (idle, no call): disable blocked 22.8 s and removed both HF endpoints (state 4), enable took
 # 3 s, and the endpoints came back as normal idle (8, "unplugged") about 90 s later. Never run it during a call.
 HFAG_UUID = "0000111f-0000-1000-8000-00805f9b34fb"
+ERROR_ACCESS_DENIED = 5
 
 
 def hf_abnormal(hf: dict) -> bool:
@@ -410,6 +419,9 @@ def refresh_hf_service(mac: str, wait: float = 120.0) -> dict:
     t0 = time.monotonic()
     out["disable_rc"] = bt.BluetoothSetServiceState(None, ctypes.byref(info), ctypes.byref(g), 0)
     out["disable_secs"] = round(time.monotonic() - t0, 1)
+    if out["disable_rc"] == ERROR_ACCESS_DENIED:   # not elevated: enabling is pointless and the wait below would burn `wait` s
+        out["error"] = "access_denied"
+        return out
     time.sleep(1)
     out["after_disable"] = states()
     t1 = time.monotonic()
