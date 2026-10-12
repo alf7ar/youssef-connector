@@ -1,4 +1,4 @@
-"""Runs the REAL rollback restore helper (restore.cmd via `cmd /d /s /c ""..""`, robocopy, start) on two temp folders. Windows only
+"""Runs the REAL rollback restore helper (restore.cmd via `cmd /d /e:on /v:off /s /c ""..""`, robocopy, start) on two temp folders. Windows only
 (the windows-build.yml pytest step); Linux skips it and covers the same logic with the batch interpreter in test_update_safety.py.
 Folder names have spaces, parentheses and a non-ASCII letter on purpose: that is what broke list2cmdline quoting."""
 import json

@@ -141,7 +141,7 @@ def test_restore_command_is_one_string_without_backslash_quotes(tmp_path):
     home = tmp_path / "home dir (x86)"
     cmd = guard.restore_command(home)
     assert isinstance(cmd, str) and '\\"' not in cmd                 # a str reaches Popen verbatim (no list2cmdline)
-    assert cmd == f'cmd /d /s /c ""{home / "restore.cmd"}""'
+    assert cmd == f'cmd /d /e:on /v:off /s /c ""{home / "restore.cmd"}""'
     assert (home / "restore.cmd").read_bytes().decode("ascii").startswith("@echo off")
 
 
@@ -187,3 +187,35 @@ def test_welcome_min_version_is_rc_aware(version, min_version, outdated):
     conn = core.Connector("ws://x", "tok", None, None, None, version=version)
     asyncio.run(conn._on_control({"type": "welcome", "min_version": min_version}))
     assert (conn.stop_reason == "outdated") is outdated
+
+
+def test_restore_robocopy_is_bounded_and_flags_spawn_hidden():
+    assert "/R:10 /W:3" in guard.RESTORE_SCRIPT
+    import inspect
+    assert "0x08000000" in inspect.getsource(guard._spawn)          # CREATE_NO_WINDOW
+
+
+def test_heartbeat_and_mark_clean_hammer_guard_json(tmp_path):
+    import threading
+    home = tmp_path
+    guard.record_start(home, "0.1.2", 1000.0)
+    errs, stop = [], threading.Event()
+
+    def beats():
+        while not stop.is_set():
+            guard._beat(home)
+
+    ts = [threading.Thread(target=beats) for _ in range(3)]
+    for t in ts:
+        t.start()
+    try:
+        for _ in range(2000):
+            guard.mark_clean(home)
+            st = guard._read(home / "guard.json")
+            if not st.get("clean"):
+                errs.append(st)
+    finally:
+        stop.set()
+        for t in ts:
+            t.join()
+    assert not errs and guard._read(home / "guard.json")["clean"] is True

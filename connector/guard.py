@@ -26,6 +26,7 @@ LOOP_DEATHS = 2
 BOOT_TOL_S = 120     # boot times further apart than this mean the machine restarted in between
 PENDING_ROLLED = "rolled_back.pending.json"   # staged by rollback(), moved into place by restore.cmd after a successful robocopy
 PENDING_GUARD = "guard.pending.json"
+_STATE_LOCK = threading.Lock()   # guard.json is rewritten by the heartbeat thread and by the main thread (mark_clean)
 MUTEX = "Global\\YoussefConnector"   # the single-instance mutex (main.single_instance uses this name)
 
 
@@ -132,7 +133,7 @@ def backup_current(home: Path, version: str, src: Path = None, log=print) -> boo
 RESTORE_SCRIPT = "\r\n".join([
     "@echo off",
     "ping -n 4 127.0.0.1 >nul",
-    'robocopy "%YC_BACKUP%" "%YC_TARGET%" %YC_MODE% /NFL /NDL /NJH /NJS /NP >nul 2>&1',      # stderr too: this runs detached, without a console
+    'robocopy "%YC_BACKUP%" "%YC_TARGET%" %YC_MODE% /R:10 /W:3 /NFL /NDL /NJH /NJS /NP >nul 2>&1',      # stderr too: this runs detached, without a console
     "set RC=%errorlevel%",           # then test %RC%: `if errorlevel 8` after `set` saw 0 on Windows (CI, robocopy exit 16)
     "if %RC% GEQ 8 goto fail",
     'echo %date% %time% update_rollback_restored: robocopy exit %RC% >> "%YC_HOME%\\connector.log"',
@@ -158,7 +159,7 @@ def restore_env(home: Path, backup: Path, target: Path, exe: str = "YoussefConne
 
 def restore_command(home: Path) -> str:
     """Write <home>/restore.cmd (ASCII, the same text every time) and return the ONE command-line string that runs it:
-    `cmd /d /s /c ""<path>""`. The script waits for this process to exit, mirrors the backup over the app dir and only when robocopy
+    `cmd /d /e:on /v:off /s /c ""<path>""`. The script waits for this process to exit, mirrors the backup over the app dir and only when robocopy
     succeeded (exit codes 0-7; 8+ is failure) promotes the staged rolled_back/guard state and starts the old exe; on failure it
     only logs. A str (not a list) goes to Popen verbatim, so Windows list2cmdline never turns quotes into \\" (cmd.exe does not
     unescape those: robocopy got paths with literal quote characters). /s strips exactly the outer pair of quotes, so a home path
@@ -166,11 +167,11 @@ def restore_command(home: Path) -> str:
     script = Path(home) / "restore.cmd"
     script.parent.mkdir(parents=True, exist_ok=True)
     script.write_bytes(RESTORE_SCRIPT.encode("ascii"))
-    return f'cmd /d /s /c ""{script}""'
+    return f'cmd /d /e:on /v:off /s /c ""{script}""'
 
 
 def _spawn(cmd: str, env: dict):
-    flags = (0x00000008 | 0x00000200) if os.name == "nt" else 0
+    flags = (0x00000008 | 0x00000200 | 0x08000000) if os.name == "nt" else 0   # DETACHED | NEW_PROCESS_GROUP | CREATE_NO_WINDOW
     subprocess.Popen(cmd, creationflags=flags, close_fds=True, env={**os.environ, **env})
 
 
@@ -228,10 +229,11 @@ def record_start(home: Path, version: str, now: float = None, boot: float = None
 
 
 def _beat(home: Path):
-    st = _read(home / "guard.json")
-    if st and not st.get("clean"):
-        st["alive"] = time.time()
-        _write(home / "guard.json", st)
+    with _STATE_LOCK:
+        st = _read(home / "guard.json")
+        if st and not st.get("clean"):
+            st["alive"] = time.time()
+            _write(home / "guard.json", st)
 
 
 def start_heartbeat(home: Path, stop: threading.Event = None, is_shutting_down=None) -> threading.Event:
@@ -270,8 +272,9 @@ def begin(home: Path, version: str, running: bool = None, can_rollback: bool = N
 
 
 def mark_clean(home: Path):
-    st = _read(home / "guard.json")
-    if st:
-        st["clean"] = True
-        st["alive"] = time.time()
-        _write(home / "guard.json", st)
+    with _STATE_LOCK:
+        st = _read(home / "guard.json")
+        if st:
+            st["clean"] = True
+            st["alive"] = time.time()
+            _write(home / "guard.json", st)
