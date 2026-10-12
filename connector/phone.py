@@ -80,6 +80,25 @@ async def find_iphone_mac() -> str:
     return first
 
 
+async def paired_iphones() -> list:
+    """Every paired classic-Bluetooth device whose name contains "iPhone": [{'mac', 'name', 'connected'}] (status page list)."""
+    from winrt.windows.devices.enumeration import DeviceInformation
+    out = []
+    sel = BluetoothDevice.get_device_selector_from_pairing_state(True)
+    find = getattr(DeviceInformation, "find_all_async_aqs_filter", None) or DeviceInformation.find_all_async
+    for di in await find(sel):
+        if "iphone" in (di.name or "").lower():
+            d = await BluetoothDevice.from_id_async(di.id)
+            if d is None:
+                continue
+            a = f"{d.bluetooth_address:012X}"
+            connected = d.connection_status == BluetoothConnectionStatus.CONNECTED
+            name = d.name or di.name or ""
+            d.close()
+            out.append({"mac": ":".join(a[i:i + 2] for i in range(0, 12, 2)), "name": name, "connected": connected})
+    return out
+
+
 async def iphone(mac: str) -> dict:
     """{'mac', 'name', 'paired', 'connected'} for the phone at `mac`."""
     out = {"mac": mac, "name": None, "paired": False, "connected": False}

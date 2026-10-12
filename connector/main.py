@@ -136,6 +136,54 @@ def _reason_texts(reason) -> tuple:
 
 
 # ------------------------------------------------------------------ app (status page + core)
+PHONES_TTL_S = 20.0      # the paired-device scan is cached this long (the page polls it)
+
+
+def mask_mac(mac: str) -> str:
+    """Only the last two bytes of a phone MAC are ever shown on the status page."""
+    parts = (mac or "").split(":")
+    return "**:**:**:**:" + ":".join(parts[-2:]) if len(parts) == 6 else ""
+
+
+def _list_phones() -> tuple:
+    """(phones, error): paired iPhone candidates from phone.paired_iphones(); error text only when the scan failed."""
+    try:
+        from . import phone
+        return asyncio.run(asyncio.wait_for(phone.paired_iphones(), 10)), ""
+    except Exception as e:  # noqa: BLE001
+        return [], type(e).__name__
+
+
+def _readiness_mac() -> str:
+    try:
+        from . import readiness
+        return readiness._mac[0] or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _heal_recent(n: int = 5):
+    """The last n heal actions, newest first; None when the heal module is not available."""
+    try:
+        from . import heal
+        return list(heal.status().get("actions") or [])[-n:][::-1]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _request_add_phone() -> tuple:
+    """(ok, message): opens the pairing gate when pairing.request_add() exists (P2 pairing module)."""
+    try:
+        from . import pairing
+        fn = getattr(pairing, "request_add", None)
+        if fn is None:
+            return False, "الإضافة غير متاحة الآن / Add phone not available yet"
+        fn()
+        return True, "اضغط Pair على الآيفون / Press Pair on the iPhone"
+    except Exception as e:  # noqa: BLE001
+        return False, f"فشل / failed: {type(e).__name__}"
+
+
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Youssef Connector</title><style>
 body{font-family:Segoe UI,Arial,sans-serif;max-width:560px;margin:40px auto;padding:0 16px;color:#222}
@@ -151,8 +199,25 @@ button{padding:8px 16px;margin-top:8px}.warn{color:#8a5a00}small{color:#666}</st
 <div id="warn" class="warn"></div>
 <div>المكالمة / Call: <b id="call"></b></div>
 <button id="logs">إرسال السجلات / Send logs</button> <span id="logmsg"></span></div>
+<div id="phones" class="card"><div>الهواتف / Phones <small id="inuse"></small></div><div id="plist"></div>
+<button id="addphone">إضافة هاتف / Add phone</button> <span id="addmsg"></span></div>
+<div id="heal" class="card"><div>الإصلاح التلقائي / Auto-heal</div><div id="hlist"></div></div>
 <script>
 const $=id=>document.getElementById(id);
+const row=t=>{const d=document.createElement('div');d.textContent=t;return d;};
+async function phones(){try{const j=await (await fetch('/phones')).json();
+$('inuse').textContent=j.in_use?'مستخدم: '+j.in_use:'تلقائي / auto';
+const items=(j.phones||[]).map(p=>row((p.in_use?'[مستخدم / in use] ':'')+p.name+' '+p.masked+' : '+(p.connected?'متصل / connected':'غير متصل / not connected')));
+if(!j.phones||!j.phones.length)items.push(row('لا توجد أجهزة / no paired iPhone found'));
+if(j.error)items.push(row('تعذر القراءة / read failed: '+j.error));
+$('plist').replaceChildren(...items);}catch(e){}}
+async function heal(){try{const j=await (await fetch('/heal')).json();
+const items=j.actions===null?[row('غير متاح / not available')]:j.actions.map(a=>row(new Date(a.t*1000).toLocaleTimeString()+' '+a.failure+' > '+a.action+' '+(a.ok?'نجح / ok':'فشل / failed')+(a.error?' ('+a.error+')':'')));
+if(j.actions&&!j.actions.length)items.push(row('لا توجد إجراءات / no actions yet'));
+$('hlist').replaceChildren(...items);}catch(e){}}
+$('addphone').onclick=async()=>{$('addmsg').textContent='...';try{const r=await fetch('/add-phone',{method:'POST',
+headers:{'Content-Type':'application/json'},body:'{}'});const j=await r.json();$('addmsg').textContent=j.message;$('addmsg').className=j.ok?'ok':'bad';}
+catch(e){$('addmsg').textContent='فشل / failed';$('addmsg').className='bad';}};
 async function tick(){try{const s=await (await fetch('/status')).json();$('ver').textContent=s.version;
 $('connect').style.display=s.configured?'none':'block';$('status').style.display=s.configured?'block':'none';
 $('hub').textContent=s.connected?'متصل / connected':'جاري الاتصال... / connecting...';$('hub').className=s.connected?'ok':'bad';
@@ -166,7 +231,7 @@ const j=await r.json();$('msg').textContent=j.message;$('msg').className=j.ok?'o
 $('logs').onclick=async()=>{$('logmsg').textContent='...';try{const r=await fetch('/sendlogs',{method:'POST',
 headers:{'Content-Type':'application/json'},body:'{}'});const j=await r.json();$('logmsg').textContent=j.message;$('logmsg').className=j.ok?'ok':'bad';}
 catch(e){$('logmsg').textContent='فشل / failed';$('logmsg').className='bad';}};
-tick();setInterval(tick,2000);
+tick();setInterval(tick,2000);phones();heal();setInterval(phones,10000);setInterval(heal,5000);
 </script></body></html>"""
 
 
@@ -183,9 +248,23 @@ class App:
         self.message = ""
         self.exit_for_update = False
         self.port = 0
+        self._phones = (-PHONES_TTL_S, [], "")   # (monotonic time, phones, error) of the last paired-device scan
+        self._phones_lock = threading.Lock()
 
     def configured(self) -> bool:
         return bool(self.cfg.get("url") and self.cfg.get("token"))
+
+    def phones(self) -> dict:
+        """Paired iPhone candidates for the status page: masked MAC only, plus which one is in use (config, else the one found)."""
+        with self._phones_lock:
+            t, found, err = self._phones
+            if time.monotonic() - t >= PHONES_TTL_S:
+                found, err = _list_phones()
+                self._phones = (time.monotonic(), found, err)
+        in_use = (self.cfg.get("phone_mac") or _readiness_mac()).upper()
+        rows = [{"name": p.get("name") or "", "connected": bool(p.get("connected")), "masked": mask_mac(p.get("mac", "")),
+                 "in_use": bool(in_use) and p.get("mac", "").upper() == in_use} for p in found]
+        return {"phones": rows, "error": err, "in_use": mask_mac(in_use) if in_use else ""}
 
     def status(self) -> dict:
         c = self.conn
@@ -262,17 +341,24 @@ class App:
                     return self._send(403, "forbidden", "text/plain")
                 if self.path == "/status":
                     return self._send(200, json.dumps(app.status()), "application/json")
+                if self.path == "/phones":
+                    return self._send(200, json.dumps(app.phones()), "application/json")
+                if self.path == "/heal":
+                    return self._send(200, json.dumps({"actions": _heal_recent()}), "application/json")
                 if self.path in ("/", "/index.html"):
                     return self._send(200, PAGE, "text/html; charset=utf-8")
                 self._send(404, "not found", "text/plain")
 
             def do_POST(self):
                 # JSON content type forces a CORS preflight for foreign pages; the Host check stops DNS rebinding
-                if (not self._host_ok() or self.path not in ("/connect", "/sendlogs")
+                if (not self._host_ok() or self.path not in ("/connect", "/sendlogs", "/add-phone")
                         or not self.headers.get("Content-Type", "").startswith("application/json")):
                     return self._send(403, "forbidden", "text/plain")
                 if self.path == "/sendlogs":
                     ok, msg = app.send_logs()
+                    return self._send(200, json.dumps({"ok": ok, "message": msg}), "application/json")
+                if self.path == "/add-phone":
+                    ok, msg = _request_add_phone()
                     return self._send(200, json.dumps({"ok": ok, "message": msg}), "application/json")
                 try:
                     n = min(int(self.headers.get("Content-Length") or 0), 8192)
