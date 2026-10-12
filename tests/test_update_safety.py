@@ -152,7 +152,7 @@ def run_restore_cmd(script, env, robocopy_rc):
             l = l.replace(f"%{k}%", v)
         if l.startswith("robocopy "):
             errorlevel = robocopy_rc
-        elif l == "if errorlevel 8 goto fail" and errorlevel >= 8:
+        elif l == "if %RC% GEQ 8 goto fail" and errorlevel >= 8:
             i = lines.index(":fail")
         elif l.startswith("move /y "):
             src, dst = [x for x in l.split('"') if x.strip() and x != "move /y " and not x.startswith(" >")][:2]

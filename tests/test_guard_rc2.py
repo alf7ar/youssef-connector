@@ -119,7 +119,7 @@ def test_heartbeat_refreshes_alive(tmp_path, monkeypatch):
 def test_restore_script_mirrors_and_checks_robocopy():
     sc = guard.RESTORE_SCRIPT
     assert "%YC_MODE%" in sc and "/PURGE" not in sc
-    assert sc.index("robocopy") < sc.index("if errorlevel 8 goto fail") < sc.index("move /y") < sc.index('start ""') < sc.index(":fail")
+    assert sc.index("robocopy") < sc.index("if %RC% GEQ 8 goto fail") < sc.index("move /y") < sc.index('start ""') < sc.index(":fail")
     assert sc.index("exit /b 0") < sc.index(":fail")                 # a failed restore does not start the bad build again
     assert "\r\n" in sc and "\n" not in sc.replace("\r\n", "")
     sc.encode("ascii")                                               # no path (accented / Arabic user names) inside the batch file
