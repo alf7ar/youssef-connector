@@ -14,7 +14,7 @@ LAUNCH_WAIT = 20.0      # s to wait for the Phone Link process after launching i
 LAUNCH_POLL = 1.0       # s between two process checks
 RETRY_S = 3.0           # s before the one retry of a dial that failed on a Phone Link UI failure
 RETRY_MAX_ELAPSED_S = 5.0    # a failure later than this after the dial request is never retried (hub ack_timeout is 15 s)
-RETRY_START_DEADLINE_S = 10.0  # the retry must start before this long after the dial request (after launch + wait)
+RETRY_START_DEADLINE_S = 8.0   # the retry must start before this long after the dial request (after launch + wait)
 
 REASON_NOT_RUNNING = "phone_link_not_running"
 REASON_NOT_LINKED = "phone_link_not_linked"
