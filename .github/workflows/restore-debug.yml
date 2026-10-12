@@ -1,0 +1,32 @@
+name: restore-debug
+on:
+  push:
+    branches: ['night/D9']
+jobs:
+  dbg:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: dbg
+        shell: pwsh
+        run: |
+          python -m pip install pytest
+          foreach ($name in @('plain', 'with space (x86)', 'accent é')) {
+            Write-Host "=== $name"
+            $b = Join-Path $env:RUNNER_TEMP $name
+            Remove-Item $b -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force "$b\home\previous","$b\app" | Out-Null
+            Set-Content "$b\home\previous\a.txt" old
+            Set-Content "$b\app\a.txt" new
+            Set-Content "$b\home\previous\go.cmd" "@echo started> `"$b\started.txt`""
+            $env:B = $b
+            python -c "import os,sys; sys.path.insert(0,'.'); from pathlib import Path; from connector import guard; b=Path(os.environ['B']); c=guard.restore_command(b/'home', b/'home'/'previous', b/'app', exe='go.cmd'); print(repr(c)); guard._spawn(c)"
+            Start-Sleep 12
+            Get-ChildItem $b -Recurse -Name
+            Write-Host "app\a.txt: $(Get-Content "$b\app\a.txt")"
+            Get-Content "$b\home\restore.cmd"
+          }
