@@ -49,8 +49,7 @@ async def bt_radio(turn_on: bool = False) -> dict:
         out = {"present": True, "on": None, "error": None}
         if turn_on and r.state != RadioState.ON:
             out["access"] = _enum_name(await Radio.request_access_async())
-            if out["access"] == "ALLOWED":
-                out["access"] = _enum_name(await r.set_state_async(RadioState.ON))
+            out["set"] = _enum_name(await r.set_state_async(RadioState.ON))   # always tried, as before ("UNSPECIFIED" can still work)
             await asyncio.sleep(1.5)
         out["on"] = r.state == RadioState.ON
         return out

@@ -53,7 +53,8 @@ def test_radio_on_ok_and_requests_turn_on(stubs):
 
 @pytest.mark.parametrize("radio,reason", [
     ({"present": False, "on": False, "error": None}, "no_adapter"),
-    ({"present": True, "on": False, "error": None, "access": "DENIED_BY_SYSTEM"}, "access_denied_by_system"),
+    ({"present": True, "on": False, "error": None, "access": "ALLOWED", "set": "DENIED_BY_SYSTEM"}, "access_denied_by_system"),
+    ({"present": True, "on": False, "error": None, "access": "DENIED_BY_USER", "set": "ALLOWED"}, "access_denied_by_user"),
     ({"present": True, "on": False, "error": None, "access": "ALLOWED"}, "still_off"),
     ({"present": None, "on": None, "error": "RuntimeError: boom"}, "radio_error"),
 ])

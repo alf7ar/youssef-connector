@@ -126,15 +126,15 @@ def radio_on() -> dict:
         r = asyncio.run(_phone().bt_radio(turn_on=True))
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": "radio_error", "error": _err(e)}
-    out = {"present": r.get("present"), "on": r.get("on"), "access": r.get("access"), "error": r.get("error")}
+    out = {"present": r.get("present"), "on": r.get("on"), "access": r.get("access"), "set": r.get("set"), "error": r.get("error")}
     if r.get("error"):
         return {"ok": False, "reason": "radio_error", **out}
     if r.get("present") is False:
         return {"ok": False, "reason": "no_adapter", **out}
     if r.get("on"):
         return {"ok": True, "reason": "", **out}
-    access = r.get("access")
-    return {"ok": False, "reason": f"access_{access.lower()}" if access and access != "ALLOWED" else "still_off", **out}
+    bad = next((v for v in (r.get("set"), r.get("access")) if v and v != "ALLOWED"), None)
+    return {"ok": False, "reason": f"access_{bad.lower()}" if bad else "still_off", **out}
 
 
 # ---- radio_cycle (heavy) -----------------------------------------------------------------------------------------------
