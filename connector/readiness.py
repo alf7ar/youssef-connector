@@ -51,6 +51,8 @@ REASONS = {
                       "Battery saver is on and throttles Bluetooth. Turn it off or plug in the charger."),
     "phone_link_not_running": ("برنامج Phone Link مش شغال. افتحه من قايمة ابدأ.", "Phone Link is not running. Open it from the Start menu."),
     "bluetooth_off": ("البلوتوث مقفول على اللابتوب. شغّله.", "Bluetooth is off on the laptop. Turn it on."),
+    "bluetooth_adapter_missing": ("مفيش كارت بلوتوث شغال على اللابتوب (مفصول أو متشال). فعّله من Device Manager أو وصّل دونجل.",
+                                  "No Bluetooth adapter is available on the laptop (disabled or absent). Enable it in Device Manager or plug in a dongle."),
     "iphone_not_connected": ("الآيفون مش متوصل بالبلوتوث. شغّل البلوتوث على الآيفون وقرّبه من اللابتوب.",
                              "The iPhone is not connected over Bluetooth. Turn Bluetooth on on the iPhone and bring it close."),
     "hf_refreshing": ("بجدد خدمة الصوت (Hands-Free) مع الآيفون. هتاخد حوالي دقيقتين.",
@@ -368,6 +370,8 @@ def auto_ready(info: dict, mac: str = "", log=_print_log) -> tuple:
         return False, "phone_link_not_running"
     radio = asyncio.run(phone.bt_radio())
     info["bt_radio"] = radio.get("on")
+    if radio.get("present") is False:   # no Bluetooth radio listed at all: adapter disabled in Device Manager or absent
+        return False, "bluetooth_adapter_missing"
     if radio.get("on") is False:
         return False, "bluetooth_off"
     cfg_mac = mac
