@@ -140,3 +140,76 @@ def test_ready_failed_fallback_has_arabic(tmp_path):
         return hb["ready"]
     r = asyncio.run(go())
     assert r["ok"] is False and r["reason"].startswith("ready() failed") and "الجاهزية" in r["reason_ar"] and r["reason_en"]
+
+
+def _core_rig(hub, collect_logs):
+    from connector import core
+    from connector.fakes import FakeAudio, FakeGate, FakePhone
+    clock = core.Clock(speed=20.0)
+    conn = core.Connector(hub.url, TOKEN, FakePhone("answer", clock=clock), FakeAudio(clock=clock), FakeGate(True), clock=clock,
+                          collect_logs=collect_logs)
+    return conn, asyncio.create_task(conn.run())
+
+
+def test_hub_send_logs_request_uploads_redacted_logs(tmp_path):
+    (tmp_path / "connector.log").write_text(f"hub asked for logs\nheader X-Connector-Token: {TOKEN}\n", encoding="utf-8")
+
+    async def go():
+        mh = cm._mock_hub_module()
+        hub = mh.MockHub(token=TOKEN)
+        await hub.start()
+        conn, task = _core_rig(hub, lambda: logsend.collect(tmp_path, {"token": TOKEN, "url": hub.url}))
+        try:
+            await hub.wait_msg("hello", timeout=10)
+            await hub._send(type="send_logs")
+            m = await hub.wait_msg("logs", timeout=10)
+            assert "hub asked for logs" in m["text"] and TOKEN not in m["text"]
+        finally:
+            conn.stop()
+            task.cancel()
+            await hub.stop()
+    asyncio.run(go())
+
+
+def test_hub_send_logs_request_during_call_replies_busy(tmp_path):
+    from connector import core
+
+    async def go():
+        mh = cm._mock_hub_module()
+        hub = mh.MockHub(token=TOKEN)
+        await hub.start()
+        uploads = []
+        conn, task = _core_rig(hub, lambda: uploads.append(1) or "LOGS")
+        try:
+            await hub.wait_msg("hello", timeout=10)
+            conn._call = core._Call("c1", asyncio.get_running_loop())     # a live call: reason stays None until it ends
+            await hub._send(type="send_logs")
+            await hub.wait_msg("logs_busy", timeout=10)
+            assert uploads == [] and not any(t == "logs" for t, _, _ in hub.msgs)
+            conn._call.finish("agent_end")                                 # call over: the same request now uploads
+            await hub._send(type="send_logs")
+            m = await hub.wait_msg("logs", timeout=10)
+            assert m["text"] == "LOGS" and uploads == [1]
+        finally:
+            conn.stop()
+            task.cancel()
+            await hub.stop()
+    asyncio.run(go())
+
+
+def test_send_logs_request_ignored_without_collector():
+    async def go():
+        mh = cm._mock_hub_module()
+        hub = mh.MockHub(token=TOKEN)
+        await hub.start()
+        conn, task = _core_rig(hub, None)
+        try:
+            await hub.wait_msg("hello", timeout=10)
+            await hub._send(type="send_logs")
+            await asyncio.sleep(0.5)
+            assert not any(t in ("logs", "logs_busy") for t, _, _ in hub.msgs)
+        finally:
+            conn.stop()
+            task.cancel()
+            await hub.stop()
+    asyncio.run(go())

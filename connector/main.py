@@ -323,7 +323,8 @@ class App:
                 ready_orig = phone.ready
                 phone.ready = lambda: {**ready_orig(), "update_rolled_back": rb}
             self.conn = core.Connector(ws_base(self.cfg["url"]), self.cfg["token"], phone, audio, gate,
-                                       audio_route=route, version=self.version, log=lambda *a: self.log(*a))
+                                       audio_route=route, version=self.version, log=lambda *a: self.log(*a),
+                                       collect_logs=lambda: logsend.collect(self.home, self.cfg))
             task = asyncio.create_task(self.conn.run())
             while not task.done() and not self.stop_event.is_set():
                 await asyncio.sleep(0.5)
