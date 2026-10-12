@@ -223,9 +223,10 @@ class App:
         return bool(self.cfg.get("url") and self.cfg.get("token"))
 
     def keep_awake_active(self) -> bool:
-        """Connected to the hub and the latest heartbeat said ready (read by the keep-awake thread)."""
+        """Connected to the hub and the latest heartbeat said ready, or a call is live (ready() is ok:False during a call)."""
         c = self.conn
-        return bool(c is not None and getattr(c, "_ws", None) is not None and (getattr(c, "last_ready", None) or {}).get("ok"))
+        return bool(c is not None and getattr(c, "_ws", None) is not None
+                    and ((getattr(c, "last_ready", None) or {}).get("ok") or self.in_call()))
 
     def status(self) -> dict:
         c = self.conn

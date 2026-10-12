@@ -12,7 +12,7 @@ on:
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}   # never cancel a tag (release) build
 
 permissions:
   contents: write

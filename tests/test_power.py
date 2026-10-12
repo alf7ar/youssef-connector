@@ -91,6 +91,10 @@ def test_app_keep_awake_active_needs_connected_and_ready(tmp_path):
     assert app.keep_awake_active() is False
     app.conn.last_ready = None
     assert app.keep_awake_active() is False
+    app.conn._call = type("Call", (), {"reason": None})()   # in a call ready() says ok:False / call_active: stay awake
+    assert app.keep_awake_active() is True
+    app.conn._ws = None
+    assert app.keep_awake_active() is False
 
 
 def test_status_token_rejected(tmp_path):

@@ -139,7 +139,7 @@ RESTORE_SCRIPT = "\r\n".join([
     'echo %date% %time% update_rollback_restored: robocopy exit %RC% >> "%YC_HOME%\\connector.log"',
     f'move /y "%YC_HOME%\\{PENDING_ROLLED}" "%YC_HOME%\\rolled_back.json" >nul',
     f'move /y "%YC_HOME%\\{PENDING_GUARD}" "%YC_HOME%\\guard.json" >nul',
-    'start "" "%YC_TARGET%\\%YC_EXE%"',
+    'start "" "%YC_TARGET%\\%YC_EXE%" --supervise',   # keep supervision after a rollback (older builds ignore the flag)
     "exit /b 0",
     ":fail",
     'echo %date% %time% update_rollback_failed: robocopy exit %RC%, the app was not restored >> "%YC_HOME%\\connector.log"',
