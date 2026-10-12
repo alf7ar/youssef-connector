@@ -27,7 +27,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import guard, logsend, update
+from . import guard, logsend, power, update
 
 MUTEX = guard.MUTEX
 PORT = 5076
@@ -80,6 +80,9 @@ def parse_connect_code(code: str) -> tuple:
     if not tok or not url.lower().startswith(("https://", "http://127.0.0.1", "http://localhost", "wss://", "ws://127.0.0.1")):
         raise ValueError("الكود غير صحيح / Invalid code")
     return url, tok
+
+
+TOKEN_REJECTED_MSG = "الكود قديم أو غير صحيح، جاري إعادة المحاولة كل ٥ دقايق / Code rejected by the server (old or wrong), retrying every 5 minutes"
 
 
 def http_base(url: str) -> str:
@@ -187,6 +190,11 @@ class App:
     def configured(self) -> bool:
         return bool(self.cfg.get("url") and self.cfg.get("token"))
 
+    def keep_awake_active(self) -> bool:
+        """Connected to the hub and the latest heartbeat said ready (read by the keep-awake thread)."""
+        c = self.conn
+        return bool(c is not None and getattr(c, "_ws", None) is not None and (getattr(c, "last_ready", None) or {}).get("ok"))
+
     def status(self) -> dict:
         c = self.conn
         call = getattr(c, "_call", None)
@@ -196,10 +204,14 @@ class App:
                 ready = dict(self.phone.ready())
             if ready and not ready.get("ok") and not ready.get("reason_ar"):
                 ready["reason_ar"], ready["reason_en"] = _reason_texts(ready.get("reason"))
-        return {"version": self.version, "configured": self.configured(),
+        st = {"version": self.version, "configured": self.configured(),
                 "connected": bool(c is not None and getattr(c, "_ws", None) is not None),
                 "ready": ready, "call": (call.id if call is not None and call.reason is None else None),
                 "message": self.message}
+        if c is not None and getattr(c, "token_rejected", False):
+            st["state"] = "token_rejected"
+            st["message"] = TOKEN_REJECTED_MSG
+        return st
 
     def send_logs(self) -> tuple:
         """(ok, message): the tails of connector.log + crash.log, redacted, over the control socket. Called from the status-page thread."""
@@ -576,6 +588,7 @@ def main(argv=None) -> int:
     if not app.configured():
         with contextlib.suppress(Exception):
             webbrowser.open(f"http://127.0.0.1:{port}/")
+    keep_awake = power.KeepAwake(app.keep_awake_active, log).start() if os.name == "nt" else None
     try:
         asyncio.run(app.run("--no-update" not in argv))
     except KeyboardInterrupt:
@@ -583,6 +596,9 @@ def main(argv=None) -> int:
     except Exception:  # noqa: BLE001
         log("fatal: " + traceback.format_exc())
         return 1
+    finally:
+        if keep_awake is not None:
+            keep_awake.stop()
     guard.mark_clean(home)
     return 0
 
