@@ -144,18 +144,19 @@ function Install-Repair {
     $act = $def.Actions.Create(0)       # TASK_ACTION_EXEC
     $act.Path = $PowerShellExe
     $act.Arguments = $TaskArgs
-    # never update a same-named task someone else created: delete it, then TASK_CREATE (fails if one reappeared) with the SDDL
-    Remove-RepairTask
-    $null = $svc.GetFolder('\').RegisterTaskDefinition($TaskName, $def, 2, 'SYSTEM', $null, 5, $TaskSddl)   # 2 = TASK_CREATE
-    Say "task $TaskName registered"
-
-    # 5. verify everything; a failed check rolls the whole install back
+    # folder/script owner + DACL + hash BEFORE the task exists: a SYSTEM task never points at an unverified script (R-c8b LOW-1)
     foreach ($p in @($Base, $Dir, $Script)) { Assert-SecureAcl $p }
     $h1 = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
     $h2 = (Get-FileHash -LiteralPath $Script -Algorithm SHA256).Hash
     if ($h1 -ne $h2) { throw 'installed script differs from the source' }
     $extra = @(Get-ChildItem -LiteralPath $Dir -Force | Where-Object { $_.Name -ne 'repair.ps1' })
     if ($extra.Count) { throw "unexpected files in the repair folder: $($extra.Name -join ', ')" }
+    # never update a same-named task someone else created: delete it, then TASK_CREATE (fails if one reappeared) with the SDDL
+    Remove-RepairTask
+    $null = $svc.GetFolder('\').RegisterTaskDefinition($TaskName, $def, 2, 'SYSTEM', $null, 5, $TaskSddl)   # 2 = TASK_CREATE
+    Say "task $TaskName registered"
+
+    # 5. verify the task; a failed check rolls the whole install back
     $t = $svc.GetFolder('\').GetTask($TaskName)
     $x = [xml]$t.Xml
     $ns = @{ t = 'http://schemas.microsoft.com/windows/2004/02/mit/task' }

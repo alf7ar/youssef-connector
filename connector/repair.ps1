@@ -62,9 +62,15 @@ try {
         Add-Step 'find_adapters' ($ids.Count -gt 0) ("found " + $ids.Count)
         if ($ids.Count -eq 0) { $script:rc = 2 }
     } catch {
-        # Get-PnpDevice throws when no device of the class exists
-        Add-Step 'find_adapters' $false $_.Exception.Message
-        $script:rc = 2
+        # Get-PnpDevice throws (rc 1, no output) when no device of the class exists: that is "no adapter" (rc 2), not a failure.
+        # Any other error (CIM/module broken) is a failed step (rc 1).
+        if ("$($_.FullyQualifiedErrorId)" -like 'CmdletizationQuery_NotFound*' -or $_.Exception.Message -match 'No matching') {
+            Add-Step 'find_adapters' $true 'found 0 (no Bluetooth device)'
+            $script:rc = 2
+        } else {
+            Add-Step 'find_adapters' $false $_.Exception.Message
+            $script:rc = 1
+        }
     }
     foreach ($id in $ids) { Restart-Adapter $id }
     if ($ids.Count -gt 0 -and -not $fake) { Start-Sleep -Seconds 3 }   # let the radio enumerate before the services come back

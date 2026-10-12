@@ -141,3 +141,41 @@ def test_main_import_loads_no_winrt_module():
     r = subprocess.run([sys.executable, "-c", code], cwd=str(Path(__file__).resolve().parents[1]), capture_output=True,
                        text=True, timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+# ---- hook 5 (W1 finding) + R-c8b LOW-1 on the E1f repair task ------------------------------------------------------------
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_repair_no_adapter_is_rc2_not_a_failed_lookup():
+    """Get-PnpDevice -Class Bluetooth with no device: rc 1 + no output (NotFound) = "no adapter" (rc 2, step ok);
+    any other lookup error is a failed step (rc 1)."""
+    code = (ROOT / "connector" / "repair.ps1").read_text(encoding="utf-8")
+    catch = code[code.index("Get-PnpDevice -Class Bluetooth"):code.index("foreach ($id in $ids)")]
+    assert "CmdletizationQuery_NotFound*" in catch
+    nf, other = catch.split("} else {")
+    assert "Add-Step 'find_adapters' $true" in nf and "$script:rc = 2" in nf
+    assert "Add-Step 'find_adapters' $false" in other and "$script:rc = 1" in other
+
+
+def test_repair_py_rc2_reports_no_adapter(tmp_path, monkeypatch):
+    import json
+    import subprocess
+    from connector import repair
+    p = tmp_path / "last.json"
+
+    def fake(*args):
+        if args[0] == "/run":
+            p.write_text(json.dumps({"time": "T1", "steps": [], "rc": 2}))
+        return subprocess.CompletedProcess([], 0, "", "")
+    monkeypatch.setattr(repair, "_schtasks", fake)
+    r = repair.adapter_reset(path=p, timeout=5, poll_every=0.01, sleep=lambda s: None)
+    assert r["ok"] is False and r["error"] == "no_adapter" and r["rc"] == 2
+
+
+def test_repair_install_verifies_folder_before_the_task_is_registered():
+    code = (ROOT / "connector" / "repair_install.ps1").read_text(encoding="utf-8")
+    reg = code.index("RegisterTaskDefinition(")
+    assert code.index("Assert-SecureAcl $p }") < code.index("    Remove-RepairTask\n") < reg
+    assert code.index("installed script differs from the source") < reg
+    assert code.index("unexpected files in the repair folder") < reg

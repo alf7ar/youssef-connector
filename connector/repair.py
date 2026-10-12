@@ -88,8 +88,8 @@ def adapter_reset(*, path: Path | None = None, timeout: float = POLL_TIMEOUT, po
             rc = data.get("rc")
             ok = rc in (None, 0)
             out = {"ok": ok, "steps": data.get("steps"), "rc": rc, "seconds": round(clock() - t0, 1)}
-            if not ok:
-                out["error"] = "repair_failed"
+            if not ok:   # rc 2: no Bluetooth adapter present (Get-PnpDevice found none): nothing to restart, not a failure of the task
+                out["error"] = "no_adapter" if rc == 2 else "repair_failed"
             return out
         if clock() - t0 >= timeout:
             return {"ok": False, "error": "timeout", "seconds": round(clock() - t0, 1)}
