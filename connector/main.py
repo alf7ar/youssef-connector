@@ -27,7 +27,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import guard, logsend, update
+from . import guard, logsend, pairing, update
 
 MUTEX = guard.MUTEX
 PORT = 5076
@@ -149,8 +149,10 @@ button{padding:8px 16px;margin-top:8px}.warn{color:#8a5a00}small{color:#666}</st
 <div id="status" class="card" style="display:none">
 <div>الخادم / Hub: <b id="hub"></b></div><div>الهاتف / Phone: <b id="ready"></b></div>
 <div id="warn" class="warn"></div>
+<div id="pair" class="warn" style="display:none"></div>
 <div>المكالمة / Call: <b id="call"></b></div>
-<button id="logs">إرسال السجلات / Send logs</button> <span id="logmsg"></span></div>
+<button id="logs">إرسال السجلات / Send logs</button> <span id="logmsg"></span>
+<button id="addphone">إضافة هاتف / Add phone</button> <span id="addmsg"></span></div>
 <script>
 const $=id=>document.getElementById(id);
 async function tick(){try{const s=await (await fetch('/status')).json();$('ver').textContent=s.version;
@@ -159,6 +161,7 @@ $('hub').textContent=s.connected?'متصل / connected':'جاري الاتصال
 const r=s.ready||{};$('ready').textContent=r.ok?'جاهز / ready':'مش جاهز: '+(r.reason_ar||r.reason||'')+(r.reason_en?' / '+r.reason_en:'');
 $('ready').className=r.ok?'ok':'bad';
 $('warn').replaceChildren(...(r.warnings||[]).map(w=>{const d=document.createElement('div');d.textContent='تنبيه: '+w.ar+' / '+w.en;return d;}));
+const pg=s.pairing||{};$('pair').style.display=pg.active?'block':'none';$('pair').textContent=pg.active?(pg.message_ar+' / '+pg.message_en):'';
 $('call').textContent=s.call||'لا يوجد / none';}catch(e){}}
 $('go').onclick=async()=>{$('msg').textContent='...';const r=await fetch('/connect',{method:'POST',
 headers:{'Content-Type':'application/json'},body:JSON.stringify({code:$('code').value})});
@@ -166,6 +169,9 @@ const j=await r.json();$('msg').textContent=j.message;$('msg').className=j.ok?'o
 $('logs').onclick=async()=>{$('logmsg').textContent='...';try{const r=await fetch('/sendlogs',{method:'POST',
 headers:{'Content-Type':'application/json'},body:'{}'});const j=await r.json();$('logmsg').textContent=j.message;$('logmsg').className=j.ok?'ok':'bad';}
 catch(e){$('logmsg').textContent='فشل / failed';$('logmsg').className='bad';}};
+$('addphone').onclick=async()=>{$('addmsg').textContent='...';try{const r=await fetch('/add-phone',{method:'POST',
+headers:{'Content-Type':'application/json'},body:'{}'});const j=await r.json();$('addmsg').textContent=j.message;$('addmsg').className=j.ok?'ok':'bad';}
+catch(e){$('addmsg').textContent='فشل / failed';$('addmsg').className='bad';}};
 tick();setInterval(tick,2000);
 </script></body></html>"""
 
@@ -183,6 +189,8 @@ class App:
         self.message = ""
         self.exit_for_update = False
         self.port = 0
+        self.pairing_on = False    # True once the real (Windows) adapters run and the pairing thread is started
+        self.pairer = pairing.Pairer(lambda *a: self.log(*a), in_call=lambda: self.in_call())
 
     def configured(self) -> bool:
         return bool(self.cfg.get("url") and self.cfg.get("token"))
@@ -199,7 +207,7 @@ class App:
         return {"version": self.version, "configured": self.configured(),
                 "connected": bool(c is not None and getattr(c, "_ws", None) is not None),
                 "ready": ready, "call": (call.id if call is not None and call.reason is None else None),
-                "message": self.message}
+                "message": self.message, "pairing": self.pairer.status()}
 
     def send_logs(self) -> tuple:
         """(ok, message): the tails of connector.log + crash.log, redacted, over the control socket. Called from the status-page thread."""
@@ -214,6 +222,15 @@ class App:
         except Exception:  # noqa: BLE001
             ok = False
         return (True, "تم إرسال السجلات / Logs sent") if ok else (False, "فشل الإرسال / Send failed")
+
+    def add_phone(self) -> tuple:
+        """(ok, message): open the pairing gate for a couple of minutes (status page button; a hub command can call this too)."""
+        if self.in_call():
+            return False, "فيه مكالمة شغالة، جرب بعدين / A call is in progress, try again after it ends"
+        if not self.pairing_on:
+            return False, "غير متاح / Not available on this system"
+        self.pairer.request_add_phone()
+        return True, "افتح البلوتوث على الآيفون وانتظر / Open Bluetooth on the iPhone and wait (2 min)"
 
     def in_call(self) -> bool:
         call = getattr(self.conn, "_call", None)
@@ -268,11 +285,14 @@ class App:
 
             def do_POST(self):
                 # JSON content type forces a CORS preflight for foreign pages; the Host check stops DNS rebinding
-                if (not self._host_ok() or self.path not in ("/connect", "/sendlogs")
+                if (not self._host_ok() or self.path not in ("/connect", "/sendlogs", "/add-phone")
                         or not self.headers.get("Content-Type", "").startswith("application/json")):
                     return self._send(403, "forbidden", "text/plain")
                 if self.path == "/sendlogs":
                     ok, msg = app.send_logs()
+                    return self._send(200, json.dumps({"ok": ok, "message": msg}), "application/json")
+                if self.path == "/add-phone":
+                    ok, msg = app.add_phone()
                     return self._send(200, json.dumps({"ok": ok, "message": msg}), "application/json")
                 try:
                     n = min(int(self.headers.get("Content-Length") or 0), 8192)
@@ -318,6 +338,9 @@ class App:
                 continue
             phone, audio, gate, route = build_adapters(cfg=self.cfg, log=self.log)
             self.phone, self.audio_route = phone, route
+            if route != "fake" and os.name == "nt":
+                self.pairer.start()
+                self.pairing_on = True
             rb = guard.rolled_back_info(self.home)
             if rb:
                 ready_orig = phone.ready
@@ -445,7 +468,7 @@ def selftest(out: Path = None) -> int:
 
     def imports():
         import numpy, onnxruntime, soxr, websockets  # noqa: F401,E401
-        mods = ["core", "fakes", "vad", "update", "readiness", "micguard", "comstress"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
+        mods = ["core", "fakes", "vad", "update", "readiness", "micguard", "comstress", "pairing"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
         for m in mods:
             importlib.import_module(f"{__package__ or 'connector'}.{m}")
         return f"version {read_version()}, {len(mods)} connector modules"
