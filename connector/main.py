@@ -30,7 +30,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import eventwatch, guard, heal, logsend, micguard, pairing, power, update
+from . import eventwatch, guard, heal, logsend, micguard, netcheck, pairing, power, update
 
 MUTEX = guard.MUTEX
 PORT = 5076
@@ -644,7 +644,7 @@ def selftest(out: Path = None) -> int:
 
     def imports():
         import numpy, onnxruntime, soxr, websockets  # noqa: F401,E401
-        mods = ["core", "fakes", "vad", "update", "readiness", "heal", "micguard", "comstress", "supervisor", "eventwatch", "pairing"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
+        mods = ["core", "fakes", "vad", "update", "readiness", "heal", "micguard", "comstress", "supervisor", "eventwatch", "pairing", "netcheck"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
         for m in mods:
             importlib.import_module(f"{__package__ or 'connector'}.{m}")
         return f"version {read_version()}, {len(mods)} connector modules"
@@ -786,6 +786,7 @@ def main(argv=None) -> int:
         with contextlib.suppress(Exception):
             webbrowser.open(f"http://127.0.0.1:{port}/")
     keep_awake = power.KeepAwake(app.keep_awake_active, log).start() if os.name == "nt" else None
+    netcheck.start(lambda: http_base(app.cfg["url"]) if app.configured() else "", busy=app.in_call)
     try:
         asyncio.run(app.run("--no-update" not in argv))
     except KeyboardInterrupt:

@@ -31,6 +31,7 @@ def _sibling(name):
 
 phone = _sibling("phone")
 heal = _sibling("heal")   # self-healing coordinator (None until that module exists)
+netcheck = _sibling("netcheck")   # captive portal / proxy / hub reachability (background probes, see netcheck.py)
 
 RESUME_GAP = 20.0   # s between two 0.5 s watch ticks (wall or monotonic clock) that means the laptop slept
 HF_SETTLE = 30.0    # s after app start / resume before the idle Hands-Free check (let Bluetooth reconnect first)
@@ -75,6 +76,10 @@ WARNINGS = {
                                 "The laptop gets its internet from the same iPhone, which breaks the call audio. Connect to another Wi-Fi."),
     "old_app_running": ("البرنامج القديم (AhmedDialer) شغال وبيتعارض مع البرنامج ده. اقفله.",
                         "The old AhmedDialer app is running and conflicts with this one. Close it."),
+    "captive_portal": ("النت عليه صفحة تسجيل دخول (كافيه أو فندق). سجّل دخول الأول، أو وصّل واي فاي تاني.",
+                       "The network needs a sign-in page first (captive portal). Sign in, or connect to another Wi-Fi."),
+    "proxy_blocking": ("فيه بروكسي على اللابتوب ومانعش الوصول للسيرفر. اقفله أو وصّل نت من غيره.",
+                       "A proxy on the laptop blocks the connection to the server. Turn it off or use another network."),
 }
 OLD_APP_TASKS = ("AhmedDialerApp", "AhmedDialerOpenOnUnlock")
 # the iPhone Personal Hotspot subnet (prefix 172.20.10 /28), built from numbers: the public-repo gate rejects dotted IPv4 literals
@@ -291,6 +296,8 @@ def collect_warnings(phone_name: str = "") -> list:
         if not (hit and time.monotonic() - hit[0] < ttl):
             _kick(key, fn)     # start all stale probes first: they run side by side inside one budget
     out = []
+    if netcheck is not None:   # cached probe results of netcheck.py (never blocks)
+        out += [warning(code) for code in netcheck.warning_codes()]
     for code, probe in (("iphone_hotspot_internet", lambda: hotspot_internet(phone_name, deadline)),
                         ("old_app_running", lambda: old_app_running(deadline))):
         try:
@@ -441,13 +448,19 @@ def auto_ready(info: dict, mac: str = "", log=_print_log) -> tuple:
     return True, ""
 
 
+def _with_net(ready: dict) -> dict:
+    """Add ready["net"]: the cached network state of netcheck.py ({captive_portal, proxy, server, checked_at}), None when unavailable."""
+    ready["net"] = netcheck.snapshot() if netcheck is not None else None
+    return ready
+
+
 def check(mac: str = "", log=_print_log) -> dict:
     """PhoneAdapter.ready(): {ok, reason, reason_ar, reason_en, warnings, bt_radio, iphone_connected, hfp_audio_device, phone_link_running, session_locked,
     call_active, hf_link (bool), hf_state (MMDevices state name)}; values not probed (early exit) are None. Never raises."""
     info = {k: None for k in ("bt_radio", "iphone_connected", "hfp_audio_device", "phone_link_running", "session_locked",
                               "call_active", "hf_link", "hf_state")}
     if phone is None:
-        return decorate({"ok": False, "reason": "phone_module_unavailable", **info})
+        return _with_net(decorate({"ok": False, "reason": "phone_module_unavailable", **info}))
     try:
         tick = (time.time(), time.monotonic())
         if resumed(_prev_tick[0], tick):   # the laptop slept: let Bluetooth reconnect, then look at the Hands-Free endpoints
@@ -465,4 +478,4 @@ def check(mac: str = "", log=_print_log) -> dict:
     warns = []
     if info["call_active"] is False:   # no probes (PowerShell) while a call is up or its state is unknown
         warns = collect_warnings(_phone_name[0])
-    return decorate({"ok": ok, "reason": reason, **info}, warns)
+    return _with_net(decorate({"ok": ok, "reason": reason, **info}, warns))
