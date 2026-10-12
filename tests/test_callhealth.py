@@ -149,6 +149,7 @@ def test_no_call_audio_ends_with_audio_error_and_blocks_next_dial(monkeypatch, e
     assert ph._before_audio(101.0) == "ringing"           # talking_since = 101
     assert env.heal.reports == []
     assert ph._before_audio(101.0 + win_adapters.NO_AUDIO_S + 1) == "ended"
+    ph._flush_end()
     assert ph.end_hint() == "audio_error"
     assert [r[0] for r in env.heal.reports] == ["bt_unhealthy"]
     r = ph.ready()
@@ -157,18 +158,111 @@ def test_no_call_audio_ends_with_audio_error_and_blocks_next_dial(monkeypatch, e
     assert ph.ready()["ok"] is True                       # one heal action succeeded: the next dial may go
 
 
-def test_audio_setup_failure_reports(monkeypatch, env):
+def test_audio_setup_failure_is_not_a_bluetooth_failure(monkeypatch, env):
+    """_activate only runs once both Hands-Free endpoints are up: Bluetooth is fine, so no bt_unhealthy / bt_recovering,
+    and last_error stays visible."""
     ph = make_phone(monkeypatch, types.SimpleNamespace(endpoints=lambda: []))
     ph.t_dial = 1.0
     monkeypatch.setattr(win_adapters.micguard, "mute", lambda *a: 1 / 0)
     assert ph._activate({"capture": {"id": "c", "format": "x"}, "render": {"id": "r", "format": "x"}}, 2.0) == "ended"
-    assert [r[0] for r in env.heal.reports] == ["bt_unhealthy"] and ph.hint == "audio_error"
+    ph._flush_end()
+    assert env.heal.reports == [] and ph.hint == "audio_error" and ph.end_hint() == "audio_error"
+    assert "ZeroDivisionError" in ph.last_error
+    assert ph.ready()["ok"] is True and callhealth.recovering() is False
+
+
+def test_missing_cables_is_not_a_bluetooth_failure(monkeypatch, env):
+    ph = make_phone(monkeypatch, types.SimpleNamespace(cable_endpoints=lambda: []))
+    ph.route, ph.t_dial = "cable", 1.0
+    monkeypatch.setattr(win_adapters.win_audio, "find_cable_devices", lambda: (None, None, {}))
+    assert ph._activate({"capture": {"id": "c"}, "render": {"id": "r"}}, 2.0) == "ended"
+    ph._flush_end()
+    assert env.heal.reports == [] and "cables missing" in ph.last_error
+
+
+def test_hf_seen_resets_on_new_call(monkeypatch, env):
+    ph = make_phone(monkeypatch, types.SimpleNamespace())
+    ph.hf_seen = True
+    ph._reset()
+    assert ph.hf_seen is False and ph.pending_end is None
+
+
+def test_restore_runs_before_health_report(monkeypatch, env):
+    ph = make_phone(monkeypatch, types.SimpleNamespace())
+    ph.t_dial, ph.stuck_logged = 1.0, True
+    order = []
+    ph._restore = lambda: order.append("restore")
+    env.heal.report = lambda *a, **k: order.append("report")
+    ph._end(None)
+    ph._flush_end()
+    assert order == ["restore", "report"]
+
+
+def test_only_bt_unhealthy_success_closes_window(env):
+    callhealth.mark_unhealthy("audio_error", now=0.0)
+    env.heal.ring.append({"failure": "bluetooth_off", "action": "radio_on", "ok": True})
+    assert callhealth.recovering(now=1.0) is True
+    env.heal.succeed("hf_refresh")
+    assert callhealth.recovering(now=2.0) is False
+
+
+class LockyHeal:
+    """Like the real heal engine: status() holds its lock while calling the in_call callback, report() takes the same lock."""
+
+    def __init__(self, in_call):
+        self.lock, self.in_call = threading.Lock(), in_call
+
+    def report(self, failure, **detail):
+        with self.lock:
+            pass
+
+    def status(self):
+        with self.lock:
+            self.in_call()
+        return {}
+
+
+def test_no_deadlock_with_lock_taking_in_call(monkeypatch, env):
+    ph = make_phone(monkeypatch, types.SimpleNamespace(
+        hf_endpoints=lambda: {}, phone_calls=lambda: [{"id": 1, "state": "talking"}], call_flags=lambda: {"call_active": True},
+        audio_to_laptop=lambda: {"ok": True}))
+
+    def in_call():
+        with ph.lock:   # e.g. WinPhone.busy() grown a lock
+            pass
+    monkeypatch.setattr(callhealth, "heal", LockyHeal(in_call))
+    ph._before_audio = lambda now: ph._end(None)
+    stop, done = threading.Event(), []
+
+    def heartbeat():   # heal.status() + ready() -> recovering(), as the heartbeat thread does
+        while not stop.is_set():
+            callhealth.heal.status()
+            callhealth.recovering()
+
+    def calls():
+        for _ in range(300):
+            with ph.lock:
+                ph._reset()
+                ph.t_dial = 100.0
+                ph.stuck_logged = True
+            assert ph.call_state() == "ended"   # _end under the phone lock, the health report outside it
+            callhealth.recovering()
+        done.append(1)
+    hb = threading.Thread(target=heartbeat, daemon=True)
+    cl = threading.Thread(target=calls, daemon=True)
+    hb.start()
+    cl.start()
+    cl.join(10)
+    stop.set()
+    hb.join(5)
+    assert done == [1] and not hb.is_alive(), "deadlock between the heartbeat and the call thread"
 
 
 def test_hf_link_stuck_then_callee_gone_reports(monkeypatch, env):
     ph = make_phone(monkeypatch, types.SimpleNamespace())
     ph.t_dial, ph.stuck_logged = 1.0, True
     assert ph._end(None) == "ended"
+    ph._flush_end()
     assert [r[0] for r in env.heal.reports] == ["bt_unhealthy"] and env.heal.reports[0][1]["why"] == "hf_link_stuck"
 
 
@@ -176,6 +270,7 @@ def test_stuck_but_audio_came_up_is_healthy(monkeypatch, env):
     ph = make_phone(monkeypatch, types.SimpleNamespace())
     ph.t_dial, ph.stuck_logged, ph.active = 1.0, True, True
     ph._end("callee_hangup")
+    ph._flush_end()
     assert env.heal.reports == [] and ph.ready()["ok"] is True
 
 
@@ -184,6 +279,7 @@ def test_normal_call_end_is_healthy(monkeypatch, env, hint):
     ph = make_phone(monkeypatch, types.SimpleNamespace())
     ph.t_dial = 1.0
     ph._end(hint)
+    ph._flush_end()
     assert env.heal.reports == [] and callhealth.recovering() is False
 
 
@@ -232,6 +328,15 @@ def test_hangup_everything_fails_still_restores(monkeypatch, env):
     assert fp.link_calls == ["hangup"]
     assert env.heal.reports[0][0] == "hangup_failed" and env.heal.reports[0][1]["recovered"] is False
     assert ph.ended and env.mg.restores == ["call_end"] and ph.switched is False
+
+
+def test_hangup_unreadable_state_is_not_recovered(monkeypatch, env):
+    def boom():
+        raise OSError("no state")
+    fp = FakePhone(end_ok=False, link_ok=False)
+    fp.phone_calls, fp.call_flags = boom, boom
+    r = callhealth.hangup(fp, sleep=lambda s: None)
+    assert r["live_after"] is True and env.heal.reports[-1][1]["recovered"] is False
 
 
 def test_hangup_without_call_is_quiet(monkeypatch, env):

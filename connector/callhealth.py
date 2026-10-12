@@ -42,11 +42,12 @@ def reset_for_tests():
 
 
 def _ok_attempts(node, out=None, top=True) -> frozenset:
-    """Signatures of every nested {action, ok: True, ...} record in a heal.status() dict (its shape is the heal engine's
-    business; only 'a dict with an "action" and ok True' is relied on)."""
+    """Signatures of every nested {failure: "bt_unhealthy", action, ok: True, ...} record in a heal.status() dict (its shape is
+    the heal engine's business; only 'a dict with failure "bt_unhealthy", an "action" and ok True' is relied on: a success
+    for another failure, e.g. radio_on for bluetooth_off, does not mean the Hands-Free link is healthy)."""
     out = set() if out is None else out
     if isinstance(node, dict):
-        if not top and node.get("ok") is True and "action" in node:
+        if not top and node.get("ok") is True and "action" in node and node.get("failure") == "bt_unhealthy":
             out.add(json.dumps(node, sort_keys=True, default=str))
         for v in node.values():
             _ok_attempts(v, out, False)
@@ -74,8 +75,9 @@ def mark_unhealthy(why: str, log=None, now: float = None) -> bool:
         if log:
             log("bt_unhealthy_report_failed", error=f"{type(e).__name__}: {e}"[:150])
         return False
+    baseline = _heal_ok_set()   # heal.status() takes the heal lock and calls back into the app: never under _lock
     with _lock:
-        _st.update(since=now, baseline=_heal_ok_set(), why=why)
+        _st.update(since=now, baseline=baseline, why=why)
     if log:
         log("bt_recovering", why=why, window_s=RECOVER_S)
     return True
@@ -86,9 +88,13 @@ def recovering(now: float = None) -> bool:
     now = time.monotonic() if now is None else now
     with _lock:
         since = _st["since"]
-        if since is None:
-            return False
-        if now - since >= RECOVER_S or (_heal_ok_set() - _st["baseline"]):
+    if since is None:
+        return False
+    ok_now = _heal_ok_set() if now - since < RECOVER_S else frozenset()   # outside _lock, see mark_unhealthy
+    with _lock:
+        if _st["since"] != since:   # closed or reopened meanwhile
+            return _st["since"] is not None
+        if now - since >= RECOVER_S or (ok_now - _st["baseline"]):
             _st["since"] = None
             return False
         return True
@@ -104,9 +110,10 @@ def apply_ready(ready: dict, now: float = None) -> dict:
 
 
 def on_call_end(hint, stuck: bool, audio_was_up: bool, log=None) -> bool:
-    """Called once when a call ends. Unhealthy: the call ended with audio_error, or hf_link_stuck was logged and the call
-    audio never came up. True when the recovery window was opened."""
-    if hint == "audio_error":
+    """Called once when a call ends. Unhealthy: the call ended with audio_error before the Hands-Free endpoints were up (a
+    failure after they were up, e.g. missing cables or a mic guard error, is not Bluetooth), or hf_link_stuck was logged and
+    the call audio never came up. True when the recovery window was opened."""
+    if hint == "audio_error" and not audio_was_up:
         return mark_unhealthy("audio_error", log)
     if stuck and not audio_was_up:
         return mark_unhealthy("hf_link_stuck", log)
@@ -160,7 +167,7 @@ def hangup(ph, log=None, sleep=time.sleep, clock=time.monotonic) -> dict:
         except Exception as e:  # noqa: BLE001
             fb = {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
     r["fallback"] = fb
-    r["live_after"] = _still_live(ph, LIVE_WAIT, sleep, clock) if fb.get("ok") else bool(_live(ph))
+    r["live_after"] = _still_live(ph, LIVE_WAIT, sleep, clock) if fb.get("ok") else _live(ph) is not False   # unknown is not recovered
     if heal is not None:
         try:
             heal.report("hangup_failed", recovered=not r["live_after"], error=str(r.get("error") or fb.get("error") or "")[:150])
