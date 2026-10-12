@@ -64,9 +64,10 @@ def _noop(*a):
 
 
 def reset_for_tests():
-    global _now, _wall, _log, _in_call, _policy, _follow_up, _busy
+    global _now, _wall, _log, _in_call, _policy, _follow_up, _busy, _busy_since
     with _lock:
         _busy = False
+        _busy_since = None
         _now, _wall = time.monotonic, time.time
         _log, _in_call = _noop, (lambda: False)
         _policy = dict(DEFAULT_POLICY)
@@ -87,6 +88,7 @@ _log = _noop
 _in_call = lambda: False   # noqa: E731
 _policy = dict(DEFAULT_POLICY)
 _busy = False            # an action is running now (status()["busy"]: the updater waits for it)
+_busy_since = None       # monotonic start of the running action (status()["busy_age_s"]: the updater ignores a stuck flag)
 _follow_up = None        # action to run on the next tick (after a successful adapter_reset: hf_refresh)
 FOLLOW_UPS = {"adapter_reset": "hf_refresh"}
 
@@ -235,7 +237,7 @@ def _pick(now):
 
 def tick():
     """Run at most one due action (blocking; call from a background thread). None when nothing ran."""
-    global _follow_up, _busy
+    global _follow_up, _busy, _busy_since
     if not _tick_lock.acquire(blocking=False):
         return None
     try:
@@ -256,6 +258,7 @@ def tick():
                 detail = dict(f["detail"])
             else:
                 detail = {"follow_up": True}
+        _busy_since = _now()
         _busy = True   # before the last in-call check: a dial that starts from now on sees heal busy (is_busy) and is refused
         if _in_call_now():   # a call may have started while we picked
             _busy = False
@@ -314,6 +317,7 @@ def status() -> dict:
         for key in CAP_KEYS:
             caps[key[4:-9]] = sum(1 for t in _cap_hits.get(key, ()) if now - t < 3600.0)
         out = {"actions": list(_ring), "busy": _busy, "policy": dict(_policy), "caps": caps,
+               "busy_age_s": int(now - _busy_since) if _busy and _busy_since is not None else 0,
                "registered": sorted(_actions), "active": active}
     out["in_call"] = _in_call_now()   # the callback runs outside the lock
     return out

@@ -253,6 +253,7 @@ def _fake_mod(monkeypatch, name, **attrs):
     import types
     mod = types.ModuleType(f"connector.{name}")
     mod.__dict__.update(attrs)
+    monkeypatch.setattr(update, "_heal_postponed", [0])
     monkeypatch.setitem(sys.modules, f"connector.{name}", mod)
     return mod
 
@@ -315,3 +316,31 @@ def test_raising_heal_status_does_not_block(site, tmp_path, monkeypatch):
     _absent(monkeypatch, "pairing")
     assert update.maintenance_busy() is False
     assert run(site, tmp_path) == (True, ["YoussefConnector-Setup-0.2.0.exe"])
+
+
+def test_stuck_heal_busy_flag_ignored_after_three_postponements(site, tmp_path, monkeypatch):
+    """R-c7 S3: a heal action that never returns must not block updates forever (3 straight postponements, then update)."""
+    site("0.2.0")
+    _fake_mod(monkeypatch, "heal", status=lambda: {"busy": True, "busy_age_s": 5})
+    _absent(monkeypatch, "pairing")
+    assert [update.maintenance_busy() for _ in range(4)] == [True, True, True, False]
+    assert run(site, tmp_path) == (True, ["YoussefConnector-Setup-0.2.0.exe"])
+
+
+def test_heal_busy_older_than_ten_minutes_is_ignored(site, tmp_path, monkeypatch):
+    site("0.2.0")
+    _fake_mod(monkeypatch, "heal", status=lambda: {"busy": True, "busy_age_s": 601})
+    _absent(monkeypatch, "pairing")
+    assert update.maintenance_busy() is False
+
+
+def test_heal_idle_resets_the_postponement_count(site, tmp_path, monkeypatch):
+    site("0.2.0")
+    st = {"busy": True}
+    _fake_mod(monkeypatch, "heal", status=lambda: dict(st))
+    _absent(monkeypatch, "pairing")
+    assert update.maintenance_busy() and update.maintenance_busy()
+    st["busy"] = False
+    assert update.maintenance_busy() is False
+    st["busy"] = True
+    assert [update.maintenance_busy() for _ in range(4)] == [True, True, True, False]

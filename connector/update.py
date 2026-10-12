@@ -8,6 +8,7 @@ value when present) -> launch the Inno installer silently (it closes the running
 /FORCECLOSEAPPLICATIONS + a taskkill in PrepareToInstall, so replacing a running app never fails with "file in use") and
 exit. A sha mismatch rejects the download, logs it and keeps the current version. Never raises."""
 import hashlib
+import importlib
 import json
 import os
 import sys
@@ -133,18 +134,31 @@ def pick_manifest(channel: str, manifest_url: str = None, beta_url: str = None) 
     return b if version_key(b["version"]) > version_key(m["version"]) else m
 
 
+HEAL_BUSY_MAX_POSTPONES = 3   # heal "busy" this many checks in a row, or for longer than HEAL_BUSY_MAX_AGE_S: treat the flag as
+HEAL_BUSY_MAX_AGE_S = 600.0   # stuck (a wedged action) and update anyway: the update may be the only remote fix
+_heal_postponed = [0]
+
+
+def _sibling(name):
+    """The sibling module from sys.modules / import (tests replace it there); a stale package attribute never wins."""
+    return importlib.import_module(f"{__package__ or 'connector'}.{name}")
+
+
 def maintenance_busy() -> bool:
     """True while heal runs a heavy action or pairing is in progress (no update then). Each module is optional: absent
-    (not merged / frozen build without it) or raising -> not busy, so the update flow is unchanged."""
+    (not merged / frozen build without it) or raising -> not busy, so the update flow is unchanged. A heal busy flag that
+    stays set for HEAL_BUSY_MAX_POSTPONES checks in a row or longer than HEAL_BUSY_MAX_AGE_S is ignored (stuck)."""
     try:
-        from . import heal
-        if heal.status().get("busy"):
+        st = _sibling("heal").status()
+        if not st.get("busy"):
+            _heal_postponed[0] = 0
+        elif _heal_postponed[0] < HEAL_BUSY_MAX_POSTPONES and float(st.get("busy_age_s") or 0) <= HEAL_BUSY_MAX_AGE_S:
+            _heal_postponed[0] += 1
             return True
     except Exception:  # noqa: BLE001  (heal absent or status unavailable)
         pass
     try:
-        from . import pairing
-        if pairing.busy():
+        if _sibling("pairing").busy():
             return True
     except Exception:  # noqa: BLE001  (pairing absent or busy() unavailable)
         pass

@@ -114,13 +114,12 @@ def test_heal_endpoint_unavailable_when_module_missing(app, monkeypatch):
 
 
 def test_add_phone_calls_pairing_request_add(app, monkeypatch):
-    calls = []
-    fake = types.ModuleType("connector.pairing")
-    fake.request_add = lambda: calls.append(1)
-    monkeypatch.setitem(sys.modules, "connector.pairing", fake)
+    calls = []    # P2's App.add_phone (in-call + pairing_on gates) -> Pairer.request_add_phone
+    app.pairing_on = True
+    monkeypatch.setattr(app.pairer, "request_add_phone", lambda: calls.append(1))
     status, j = post_json(app, "/add-phone")
     assert status == 200 and j["ok"] is True and calls == [1]
-    assert "Pair" in j["message"]
+    assert "Bluetooth" in j["message"]
 
 
 def test_add_phone_stub_when_pairing_missing(app, monkeypatch):

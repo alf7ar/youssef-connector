@@ -6,6 +6,7 @@ rights) and waits for a NEW last.json. Registered with connector.heal as the hea
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import subprocess
@@ -96,8 +97,8 @@ def adapter_reset(*, path: Path | None = None, timeout: float = POLL_TIMEOUT, po
 
 def register() -> bool:
     """Register adapter_reset with connector.heal (heavy tier). False when heal is not available."""
-    try:
-        from . import heal
+    try:   # import_module: sys.modules wins over the package attribute (tests swap the module there)
+        heal = importlib.import_module(f"{__package__ or 'connector'}.heal")
     except ImportError:
         return False
     heal.register_action("adapter_reset", adapter_reset, tier="heavy")

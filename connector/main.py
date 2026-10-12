@@ -180,9 +180,9 @@ def _readiness_mac() -> str:
 
 def _heal_recent(n: int = 5):
     """The last n heal actions, newest first; None when the heal module is not available."""
-    try:
-        from . import heal
-        return list(heal.status().get("actions") or [])[-n:][::-1]
+    try:   # import_module: sys.modules wins over the package attribute (tests swap the module there)
+        h = importlib.import_module(f"{__package__ or 'connector'}.heal")
+        return list(h.status().get("actions") or [])[-n:][::-1]
     except Exception:  # noqa: BLE001
         return None
 
