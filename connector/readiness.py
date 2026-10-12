@@ -29,6 +29,7 @@ def _sibling(name):
 
 
 phone = _sibling("phone")
+heal = _sibling("heal")
 
 RESUME_GAP = 20.0   # s between two 0.5 s watch ticks (wall or monotonic clock) that means the laptop slept
 HF_SETTLE = 30.0    # s after app start / resume before the idle Hands-Free check (let Bluetooth reconnect first)
@@ -413,6 +414,11 @@ def check(mac: str = "", log=_print_log) -> dict:
         ok, reason = auto_ready(info, mac, log)
     except Exception as e:  # noqa: BLE001
         ok, reason = False, f"ready_check_failed: {type(e).__name__}"
+    if heal is not None and reason in heal.FAILURES:   # the heal engine's ladder for it (never hf_refreshing: a refresh runs)
+        try:
+            heal.report(reason)
+        except Exception:  # noqa: BLE001
+            pass
     warns = []
     if info["call_active"] is False:   # no probes (PowerShell) while a call is up or its state is unknown
         warns = collect_warnings(_phone_name[0])

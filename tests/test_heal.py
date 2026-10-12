@@ -144,7 +144,7 @@ def test_hourly_radio_cap_then_report_only(clk):
         clk.adv(heal.STALE_S + 1)
         heal.tick()
     assert ran == ["radio_on", "radio_on"]
-    assert heal.status()["used_1h"]["radio_toggles"] == 2
+    assert heal.status()["caps"]["radio_toggles"] == 2
     assert any(a[0] == "heal_skip" and json.loads(a[1])["why"] == "capped" for a in logs)
     clk.adv(3600)
     assert climb(clk, "bluetooth_off", 1) == ["radio_on"]   # the hour rolled over
@@ -159,7 +159,7 @@ def test_adapter_reset_cap(clk):
     heal.tick()
     second = climb(clk, "hf_endpoints", 3)
     assert first == ["hf_refresh", "adapter_reset"] and second == ["hf_refresh"]
-    assert heal.status()["used_1h"]["adapter_resets"] == 1
+    assert heal.status()["caps"]["adapter_resets"] == 1
 
 
 def test_in_call_blocks(clk):
@@ -184,7 +184,7 @@ def test_call_starts_between_pick_and_run(clk):
     assert heal.tick() is None and calls == []
     heal.set_in_call(lambda: False)
     assert heal.tick()["action"] == "radio_on"      # rung and cap were rolled back
-    assert heal.status()["used_1h"]["radio_toggles"] == 1
+    assert heal.status()["caps"]["radio_toggles"] == 1
 
 
 def test_reset_on_recovery(clk):
@@ -218,7 +218,7 @@ def test_exception_in_action_is_logged_failure(clk):
     rec = [json.loads(a[1]) for a in logs if a[0] == "heal_action"]
     assert rec and rec[0]["failure"] == "bluetooth_off" and rec[0]["action"] == "radio_on" and rec[0]["ok"] is False
     assert "ms" in rec[0]
-    assert heal.status()["recent"][-1]["error"].startswith("ZeroDivisionError")
+    assert heal.status()["actions"][-1]["error"].startswith("ZeroDivisionError")
 
 
 def test_report_only_and_unknown_failure(clk):
@@ -263,12 +263,110 @@ def test_status_is_small_json(clk):
         heal.tick()
     heal.report("hf_endpoints", states={"capture": 4})
     st = heal.status()
-    assert len(st["recent"]) == heal.STATUS_RECENT and set(st["recent"][0]) >= {"t", "failure", "action", "ok", "ms"}
+    assert len(st["actions"]) == heal.RING and set(st["actions"][0]) >= {"t", "failure", "action", "ok", "ms"}
+    assert isinstance(st["actions"][-1]["t"], float) and st["actions"][-1]["t"] >= st["actions"][0]["t"]   # newest last
+    assert st["busy"] is False and set(st["caps"]) == {"adapter_resets", "radio_toggles"}
     assert len(json.dumps(st)) < 4000
-    assert st["actions"] == sorted(ALL)
+    assert st["registered"] == sorted(ALL)
+
+
+def test_busy_while_action_runs(clk):
+    seen = []
+    heal.register_action("radio_on", lambda: seen.append(heal.status()["busy"]) or {"ok": True})
+    heal.report("bluetooth_off")
+    heal.tick()
+    assert seen == [True] and heal.status()["busy"] is False
 
 
 def test_non_dict_result(clk):
     heal.register_action("radio_on", lambda: True)
     heal.report("bluetooth_off")
     assert heal.tick()["ok"] is True
+
+
+# ---------------------------------------------------------------- wiring: readiness, WinPhone.busy, main (tick thread, heartbeat, policy)
+def test_readiness_check_reports_heal_failures(clk, monkeypatch):
+    from connector import readiness
+    from test_readiness_warnings import P, setup_ready
+    monkeypatch.setattr(readiness, "collect_warnings", lambda name="": [])
+    monkeypatch.setattr(readiness, "heal", heal)
+
+    async def off():
+        return {"on": False}
+    setup_ready(monkeypatch, phone=P.mk(bt_radio=staticmethod(off)))
+    assert readiness.check("", lambda *a, **k: None)["reason"] == "bluetooth_off"
+    assert "bluetooth_off" in heal.status()["active"]
+    setup_ready(monkeypatch, locked=True)          # not a heal class: not reported
+    assert readiness.check("", lambda *a, **k: None)["reason"] == "session_locked"
+    assert list(heal.status()["active"]) == ["bluetooth_off"]
+
+
+def test_readiness_does_not_report_hf_refreshing(clk, monkeypatch):
+    from connector import readiness
+    from test_readiness_warnings import P, setup_ready
+    monkeypatch.setattr(readiness, "collect_warnings", lambda name="": [])
+    monkeypatch.setattr(readiness, "heal", heal)
+    setup_ready(monkeypatch, phone=P.mk(hf_abnormal=staticmethod(lambda eps: True)))
+    monkeypatch.setattr(readiness, "_maybe_refresh", lambda mac, log: True)
+    assert readiness.check("", lambda *a, **k: None)["reason"] == "hf_refreshing"
+    monkeypatch.setattr(readiness, "_maybe_refresh", lambda mac, log: False)
+    assert readiness.check("", lambda *a, **k: None)["reason"] == "hf_endpoints"
+    assert list(heal.status()["active"]) == ["hf_endpoints"]
+
+
+def test_winphone_busy(monkeypatch):
+    from connector import win_adapters
+    flags = {"call_active": False, "call_incoming": False}
+    monkeypatch.setattr(win_adapters, "phone", type("Ph", (), {"call_flags": staticmethod(lambda: dict(flags))}))
+    w = win_adapters.WinPhone.__new__(win_adapters.WinPhone)
+    w.t_dial, w.ended = None, False
+    assert w.busy() is False
+    flags["call_incoming"] = True
+    assert w.busy() is True
+    flags.update(call_incoming=False, call_active=None)   # unknown: assume a call
+    assert w.busy() is True
+    flags["call_active"] = False
+    w.t_dial = 1.0
+    assert w.busy() is True
+
+
+def test_start_heal_thread_ticks(clk):
+    import threading
+    from connector import main as cm
+    heal._now = heal._wall = __import__("time").monotonic
+    done = threading.Event()
+    heal.register_action("radio_on", lambda: done.set() or {"ok": True})
+    heal.report("bluetooth_off")
+    app = type("A", (), {"stop_event": threading.Event(), "in_call": lambda self: False})()
+    t = cm.start_heal(app, lambda *a: None)
+    try:
+        assert done.wait(5)
+    finally:
+        app.stop_event.set()
+        t.join(5)
+    assert not t.is_alive()
+
+
+def test_app_heartbeat_has_heal_and_config_policy(clk, tmp_path, monkeypatch):
+    import asyncio
+    from connector import main as cm
+    import mock_hub
+    monkeypatch.setenv("YC_FAKE", "1")
+
+    async def go():
+        hub = mock_hub.MockHub(token="t")
+        await hub.start()
+        app = cm.App(tmp_path, "9.9.9", lambda *a: None)
+        app.cfg = {"url": hub.url, "token": "t", "heal": {"radio_cycle": True}}
+        runner = asyncio.create_task(app.run(False))
+        try:
+            hb = await hub.wait_msg("hb", timeout=20)
+        finally:
+            app.stop_event.set()
+            await asyncio.wait_for(runner, 10)
+            await hub.stop()
+        return hb
+    hb = asyncio.run(go())
+    h = hb["ready"]["heal"]
+    assert h["policy"]["radio_cycle"] is True and h["policy"]["adapter_reset"] is False
+    assert h["actions"] == [] and h["busy"] is False

@@ -46,7 +46,6 @@ CAPS = {"adapter_reset": "max_adapter_resets_per_hour", "radio_on": "max_radio_t
         "radio_cycle": "max_radio_toggles_per_hour"}
 DEFAULT_POLICY = {"radio_cycle": False, "adapter_reset": False, "max_adapter_resets_per_hour": 2, "max_radio_toggles_per_hour": 4}
 RING = 20
-STATUS_RECENT = 10
 
 _now = time.monotonic
 _wall = time.time
@@ -59,8 +58,9 @@ def _noop(*a):
 
 
 def reset_for_tests():
-    global _now, _wall, _log, _in_call, _policy, _follow_up
+    global _now, _wall, _log, _in_call, _policy, _follow_up, _busy
     with _lock:
+        _busy = False
         _now, _wall = time.monotonic, time.time
         _log, _in_call = _noop, (lambda: False)
         _policy = dict(DEFAULT_POLICY)
@@ -80,6 +80,7 @@ _cap_hits = collections.defaultdict(collections.deque)   # policy cap key -> mon
 _log = _noop
 _in_call = lambda: False   # noqa: E731
 _policy = dict(DEFAULT_POLICY)
+_busy = False            # an action is running now (status()["busy"]: the updater waits for it)
 _follow_up = None        # action to run on the next tick (after a successful adapter_reset: hf_refresh)
 FOLLOW_UPS = {"adapter_reset": "hf_refresh"}
 
@@ -217,7 +218,7 @@ def _pick(now):
 
 def tick():
     """Run at most one due action (blocking; call from a background thread). None when nothing ran."""
-    global _follow_up
+    global _follow_up, _busy
     if not _tick_lock.acquire(blocking=False):
         return None
     try:
@@ -247,6 +248,7 @@ def tick():
             return None
         t0 = _now()
         err = None
+        _busy = True
         try:
             r = fn()
             ok = bool(r.get("ok")) if isinstance(r, dict) else bool(r)
@@ -254,6 +256,8 @@ def tick():
                 err = str(r.get("reason"))[:120]
         except Exception as e:  # noqa: BLE001
             ok, err = False, f"{type(e).__name__}: {e}"[:160]
+        finally:
+            _busy = False
         end = _now()
         entry = {"t": round(_wall(), 1), "failure": failure or "follow_up", "action": act, "ok": ok, "ms": int((end - t0) * 1000)}
         if err:
@@ -274,7 +278,8 @@ def tick():
 
 
 def status() -> dict:
-    """Small JSON-safe summary for the heartbeat: policy, in_call, active failures, last actions, hourly cap use."""
+    """Small JSON-safe summary for the heartbeat: actions (the last RING attempts {t: unix s, failure, action, ok, ms[, error]},
+    newest last), busy (an action is running now), policy, caps (attempts in the last hour), in_call, registered, active failures."""
     now = _now()
     with _lock:
         active = {}
@@ -285,8 +290,8 @@ def status() -> dict:
         caps = {}
         for key in ("max_adapter_resets_per_hour", "max_radio_toggles_per_hour"):
             caps[key[4:-9]] = sum(1 for t in _cap_hits.get(key, ()) if now - t < 3600.0)
-        return {"policy": dict(_policy), "in_call": _in_call_now(), "actions": sorted(_actions), "active": active,
-                "recent": list(_ring)[-STATUS_RECENT:], "used_1h": caps}
+        return {"actions": list(_ring), "busy": _busy, "policy": dict(_policy), "caps": caps, "in_call": _in_call_now(),
+                "registered": sorted(_actions), "active": active}
 
 
 reset_for_tests()

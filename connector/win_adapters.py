@@ -137,6 +137,16 @@ class WinPhone(PhoneAdapter):
             return readiness.decorate({"ok": False, "reason": "call_active", "call_active": True})
         return readiness.check(self.mac, self._log)
 
+    def busy(self) -> bool:
+        """A call is up (ours, or one Windows sees on the line, incoming included): the heal engine must not touch Bluetooth."""
+        if self.t_dial is not None and not self.ended:
+            return True
+        try:
+            f = phone.call_flags()
+        except Exception:  # noqa: BLE001
+            return True
+        return f.get("call_active") is not False or bool(f.get("call_incoming"))
+
     def dial(self, number: str) -> bool:
         num = re.sub(r"[\s\-().]", "", str(number))
         if not NUM_RE.match(num):
