@@ -35,19 +35,24 @@ def _sibling(name):
 
 
 heal = _sibling("heal")          # owner H1's module; None until it is merged
-readiness = _sibling("readiness")
+
+
+def _readiness():
+    """readiness, imported on first use: it imports phone (winrt), which must not load at main.py import time (onnxruntime's
+    DLLs have to load before winrt's: an early winrt import crashes the selftest with an access violation)."""
+    return _sibling("readiness")
 
 
 def running() -> bool:
     """True when the Phone Link process runs (False also when that cannot be told)."""
-    return readiness._tasklist_has(PROCESS) is True
+    return _readiness()._tasklist_has(PROCESS) is True
 
 
 def launch() -> dict:
     """Start Phone Link (no window) when it is not running, then wait up to LAUNCH_WAIT s for its process.
     An unknown process state (tasklist failed) is not "not running": nothing is launched then.
     Returns {ok, launched, running[, error]}. Blocking; heal runs it in its own thread."""
-    state = readiness._tasklist_has(PROCESS)
+    state = _readiness()._tasklist_has(PROCESS)
     if state is True:
         return {"ok": True, "launched": False, "running": True}
     if state is None:

@@ -129,3 +129,15 @@ def test_events_and_heal_status_compose_whatever_the_wrap_order(fresh_heal):
     for r in (events_outside, events_inside):
         assert r["heal"]["events"] == EVS
         assert set(heal.status()) <= set(r["heal"]) and r["heal"]["busy"] is False and r["ok"] is True
+
+
+def test_main_import_loads_no_winrt_module():
+    """The static imports must not pull in phone (winrt) / readiness / win_adapters / vad: onnxruntime has to load before
+    winrt (PORT_NOTES), else the Windows selftest dies with 0xC0000005 (phonelink imported readiness at module level)."""
+    import subprocess
+    code = ("import sys; import connector.main; "
+            "bad = [m for m in sys.modules if m in ('connector.phone', 'connector.readiness', 'connector.win_adapters', "
+            "'connector.vad', 'onnxruntime') or m.startswith('winrt')]; print(bad); sys.exit(1 if bad else 0)")
+    r = subprocess.run([sys.executable, "-c", code], cwd=str(Path(__file__).resolve().parents[1]), capture_output=True,
+                       text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
