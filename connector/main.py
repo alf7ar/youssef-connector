@@ -203,6 +203,8 @@ class App:
 
     def send_logs(self) -> tuple:
         """(ok, message): the tails of connector.log + crash.log, redacted, over the control socket. Called from the status-page thread."""
+        if self.in_call():
+            return False, "فيه مكالمة شغالة، جرب بعدين / A call is in progress, try again after it ends"
         c, loop = self.conn, self.loop
         if c is None or loop is None or getattr(c, "_ws", None) is None:
             return False, "مفيش اتصال بالخادم / Not connected to the hub"

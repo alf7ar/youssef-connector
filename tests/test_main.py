@@ -97,6 +97,7 @@ def test_e2e_fake_adapters(tmp_path, monkeypatch, capsys):
 def test_selftest_runs_clean(tmp_path):
     """In its own process: on Windows --selftest imports the real winrt/COM modules, which other tests stub in sys.modules."""
     import subprocess
+    pytest.importorskip("onnxruntime")      # --selftest imports it; Linux CI without the wheel skips instead of failing
     out = tmp_path / "selftest.txt"
     root = Path(__file__).resolve().parents[1]
     p = subprocess.run([sys.executable, "-m", "connector.main", "--selftest", "--selftest-out", str(out)], cwd=root, timeout=90,

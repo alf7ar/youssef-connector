@@ -82,6 +82,25 @@ def test_send_logs_offline(tmp_path):
     assert ok is False and "Not connected" in msg
 
 
+def test_send_logs_refused_during_call(tmp_path):
+    class Call:
+        id = "c1"
+        reason = None       # an active call: reason is set only once it has ended
+
+    class C:
+        _ws = object()
+        _call = Call()
+    app = cm.App(tmp_path, "9.9.9", lambda *a: None)
+    app.conn = C()
+    app.loop = None         # would otherwise fail as "Not connected": the call check must come first
+    (tmp_path / "connector.log").write_text("hello\n", encoding="utf-8")
+    ok, msg = app.send_logs()
+    assert ok is False and "call" in msg and "مكالمة" in msg
+    C._call.reason = "agent_end"    # call ended: the same request is no longer refused by the call check
+    ok, msg = app.send_logs()
+    assert ok is False and "Not connected" in msg
+
+
 def test_status_has_arabic_reason_and_warnings(tmp_path):
     class P:
         def ready(self):
