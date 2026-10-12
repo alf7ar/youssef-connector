@@ -246,3 +246,72 @@ def test_ready_dict_reports_rollback(tmp_path, monkeypatch):
         return r
     r = asyncio.run(go())
     assert r["update_rolled_back"] == {"from": "0.1.2", "to": "0.1.1"}
+
+
+# ---------------------------------------------------------------- no update during heal heavy action / pairing
+def _fake_mod(monkeypatch, name, **attrs):
+    import types
+    mod = types.ModuleType(f"connector.{name}")
+    mod.__dict__.update(attrs)
+    monkeypatch.setitem(sys.modules, f"connector.{name}", mod)
+    return mod
+
+
+def _absent(monkeypatch, name):
+    monkeypatch.setitem(sys.modules, f"connector.{name}", None)     # import raises ImportError
+
+
+def test_no_update_while_heal_busy(site, tmp_path, monkeypatch):
+    site("0.2.0")
+    _fake_mod(monkeypatch, "heal", status=lambda: {"busy": True})
+    _absent(monkeypatch, "pairing")
+    assert run(site, tmp_path) == (False, [])
+    assert not (tmp_path / "dl").exists()
+    assert not update.update_attempted_recently("0.2.0", tmp_path / "home")
+
+
+def test_update_proceeds_when_heal_idle(site, tmp_path, monkeypatch):
+    site("0.2.0")
+    _fake_mod(monkeypatch, "heal", status=lambda: {"busy": False})
+    _absent(monkeypatch, "pairing")
+    assert run(site, tmp_path) == (True, ["YoussefConnector-Setup-0.2.0.exe"])
+
+
+def test_no_update_while_pairing(site, tmp_path, monkeypatch):
+    site("0.2.0")
+    _absent(monkeypatch, "heal")
+    _fake_mod(monkeypatch, "pairing", busy=lambda: True)
+    assert run(site, tmp_path) == (False, [])
+    assert not (tmp_path / "dl").exists()
+
+
+def test_heal_heavy_action_starting_mid_download_postpones(site, tmp_path, monkeypatch):
+    site("0.2.0")
+    seq = iter([False, True])          # first check (before download) idle, second (before launch) busy
+    _fake_mod(monkeypatch, "heal", status=lambda: {"busy": next(seq)})
+    _absent(monkeypatch, "pairing")
+    logs = []
+    launched = []
+    r = update.try_update("0.1.0", tmp_path / "home", logs.append, manifest_url=site.base + "/latest.json",
+                          beta_url=site.base + "/latest-beta.json", launch=launched.append, tmpdir=tmp_path / "dl")
+    assert r is False and launched == []
+    assert any("heal or pairing in progress, postponed" in l for l in logs)
+    assert not update.update_attempted_recently("0.2.0", tmp_path / "home")
+
+
+def test_absent_heal_and_pairing_do_not_block(site, tmp_path, monkeypatch):
+    site("0.2.0")
+    _absent(monkeypatch, "heal")
+    _absent(monkeypatch, "pairing")
+    assert update.maintenance_busy() is False
+    assert run(site, tmp_path) == (True, ["YoussefConnector-Setup-0.2.0.exe"])
+
+
+def test_raising_heal_status_does_not_block(site, tmp_path, monkeypatch):
+    site("0.2.0")
+    def boom():
+        raise RuntimeError("status unavailable")
+    _fake_mod(monkeypatch, "heal", status=boom)
+    _absent(monkeypatch, "pairing")
+    assert update.maintenance_busy() is False
+    assert run(site, tmp_path) == (True, ["YoussefConnector-Setup-0.2.0.exe"])

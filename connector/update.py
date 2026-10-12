@@ -133,12 +133,33 @@ def pick_manifest(channel: str, manifest_url: str = None, beta_url: str = None) 
     return b if version_key(b["version"]) > version_key(m["version"]) else m
 
 
+def maintenance_busy() -> bool:
+    """True while heal runs a heavy action or pairing is in progress (no update then). Each module is optional: absent
+    (not merged / frozen build without it) or raising -> not busy, so the update flow is unchanged."""
+    try:
+        from . import heal
+        if heal.status().get("busy"):
+            return True
+    except Exception:  # noqa: BLE001  (heal absent or status unavailable)
+        pass
+    try:
+        from . import pairing
+        if pairing.busy():
+            return True
+    except Exception:  # noqa: BLE001  (pairing absent or busy() unavailable)
+        pass
+    return False
+
+
 def try_update(local: str, home: Path, log=print, manifest_url: str = None, launch=launch_installer,
                tmpdir: Path = None, channel: str = None, beta_url: str = None, busy=None, before_launch=None) -> bool:
     """True if an installer was launched (the caller must exit now). Never raises.
-    busy() -> True while a call is active: no update is downloaded or launched then (checked again right before launch)."""
+    busy() -> True while a call is active: no update is downloaded or launched then (checked again right before launch).
+    maintenance_busy() (heal heavy action / pairing) is checked at the same two points."""
     try:
         if busy and busy():
+            return False
+        if maintenance_busy():
             return False
         m = pick_manifest(channel, manifest_url, beta_url)
         if not is_newer(m["version"], local):
@@ -159,6 +180,9 @@ def try_update(local: str, home: Path, log=print, manifest_url: str = None, laun
             return False
         if busy and busy():
             log("update: call in progress, postponed")
+            return False
+        if maintenance_busy():
+            log("update: heal or pairing in progress, postponed")
             return False
         if before_launch:
             before_launch()
