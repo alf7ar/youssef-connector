@@ -31,7 +31,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import eventwatch, guard, heal, logsend, micguard, netcheck, pairing, power, update
+from . import bt_actions, eventwatch, guard, heal, logsend, micguard, netcheck, pairing, phonelink, power, repair, update
 
 MUTEX = guard.MUTEX
 PORT = 5076
@@ -484,7 +484,7 @@ class App:
                                        collect_logs=lambda: logsend.collect(self.home, self.cfg),
                                        home=micguard.HOME)   # remote_config.json + dns_cache.json: where win_adapters (ns) reads them
             if hasattr(self.conn, "on_config"):   # server-pushed config (welcome "config"): its "heal" policy
-                self.conn.on_config(lambda c: heal.set_policy((c or {}).get("heal") if isinstance(c, dict) else None))
+                self.conn.on_config(apply_remote_config)
             task = asyncio.create_task(self.conn.run())
             while not task.done() and not self.stop_event.is_set():
                 await asyncio.sleep(0.5)
@@ -515,7 +515,9 @@ HEAL_EVERY = 2.0   # s between heal.tick() calls
 def heal_ready(ready_orig, rolled_back=None):
     """The phone.ready wrapper: adds update_rolled_back and the heal status; not ready (heal_busy) while a repair action runs."""
     def ready():
-        r = {**ready_orig(), **({"update_rolled_back": rolled_back} if rolled_back else {}), "heal": heal.status()}
+        r = dict(ready_orig())
+        prev = r.get("heal") if isinstance(r.get("heal"), dict) else {}   # e.g. the event watcher's "events": kept (any wrap order)
+        r.update(**({"update_rolled_back": rolled_back} if rolled_back else {}), heal={**prev, **heal.status()})
         if heal.is_busy():
             from . import readiness
             r.update(ok=False, reason="heal_busy")
@@ -524,15 +526,30 @@ def heal_ready(ready_orig, rolled_back=None):
     return ready
 
 
+def register_heal_actions(log) -> list:
+    """Register the repair actions with heal (before the tick thread starts): Bluetooth (radio_on, hf_refresh, phone_connect,
+    radio_cycle), the elevated adapter_reset task, Phone Link launch. Idempotent. -> registered names."""
+    for name, fn in (("bt_actions", lambda: bt_actions.register(heal)), ("repair", repair.register),
+                     ("phonelink", lambda: heal.register_action("phone_link_launch", phonelink.launch, tier="safe"))):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            log("heal_register_failed", name, f"{type(e).__name__}: {e}"[:200])
+    return heal.status().get("registered") or []
+
+
+def apply_remote_config(cfg) -> None:
+    """core.on_config callback (welcome "config"): "heal" -> heal.set_policy (it keeps only the contract keys; heavy tiers
+    need a literal True). A config without "heal" leaves the current policy alone."""
+    if isinstance(cfg, dict) and "heal" in cfg:
+        heal.set_policy(cfg.get("heal"))
+
+
 def start_heal(app: App, log) -> threading.Thread:
     """Daemon thread: heal.tick() every HEAL_EVERY s (at most one repair action per tick, never during a call)."""
     heal.set_log(log)
     heal.set_in_call(app.in_call)
-    try:   # the Bluetooth repair actions (radio_on, hf_refresh, phone_connect, radio_cycle); without winrt they stay unregistered
-        from . import bt_actions
-        bt_actions.register(heal)
-    except Exception as e:  # noqa: BLE001
-        log("heal_register_failed", f"{type(e).__name__}: {e}"[:200])
+    register_heal_actions(log)
 
     def run():
         while not app.stop_event.is_set():

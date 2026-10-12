@@ -34,6 +34,9 @@ LADDERS = {
     "net_dns": (),
 }
 FAILURES = tuple(LADDERS)
+# readiness reasons heal deliberately does not act on (report() drops them): no Bluetooth adapter listed at all (disabled in
+# Device Manager or absent, H2) -> nothing to toggle; the user must enable it / plug a dongle (the ready reason says so)
+IGNORED = ("bluetooth_adapter_missing",)
 # s an action blocks re-runs of itself (any failure) and, after it ran for a failure, before that failure's next rung
 COOLDOWN = {"radio_on": 20.0, "phone_connect": 30.0, "phone_link_launch": 30.0, "hf_refresh": 180.0, "radio_cycle": 120.0,
             "adapter_reset": 300.0}
@@ -151,6 +154,8 @@ def _clean(detail: dict) -> dict:
 
 def report(failure, **detail):
     failure = str(failure)
+    if failure in IGNORED:
+        return
     now = _now()
     with _lock:
         f = _failures.get(failure)

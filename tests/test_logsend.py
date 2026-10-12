@@ -258,3 +258,40 @@ def test_send_logs_request_ignored_without_collector():
             task.cancel()
             await hub.stop()
     asyncio.run(go())
+
+
+def test_send_logs_rechecks_call_after_reading_and_logs_collect_failure():
+    """R-c6 nits: a call that starts while the logs are read gets logs_busy (no upload); a collect error is logged."""
+    from connector import core
+
+    async def go():
+        mh = cm._mock_hub_module()
+        hub = mh.MockHub(token=TOKEN)
+        await hub.start()
+        holder = {}
+
+        def collect():
+            holder["conn"]._call = holder["call"]     # the dial lands while the logs are being read
+            return "LOGS"
+        conn, task = _core_rig(hub, collect)
+        holder["conn"], holder["call"] = conn, core._Call("c1", asyncio.get_running_loop())
+        logs = []
+        try:
+            await hub.wait_msg("hello", timeout=10)
+            await hub._send(type="send_logs")
+            await hub.wait_msg("logs_busy", timeout=10)
+            assert not any(t == "logs" for t, _, _ in hub.msgs)
+            holder["call"].finish("agent_end")
+            conn.collect_logs = lambda: (_ for _ in ()).throw(OSError("locked"))
+            conn.log = lambda *a: logs.append(" ".join(map(str, a)))
+            await hub._send(type="send_logs")
+            for _ in range(50):
+                if logs:
+                    break
+                await asyncio.sleep(0.05)
+            assert any("collect failed" in l for l in logs)
+        finally:
+            conn.stop()
+            task.cancel()
+            await hub.stop()
+    asyncio.run(go())

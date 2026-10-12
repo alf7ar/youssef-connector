@@ -467,7 +467,14 @@ class Connector:
         if self.in_call():
             await self._send({"type": "logs_busy"})
             return
-        text = await asyncio.to_thread(self.collect_logs)
+        try:
+            text = await asyncio.to_thread(self.collect_logs)
+        except Exception as e:  # noqa: BLE001
+            self.log("send_logs requested: collect failed:", repr(e)[:200])
+            return
+        if self.in_call():   # a dial landed while the logs were read: no 600 KB upload during ring
+            await self._send({"type": "logs_busy"})
+            return
         if not await self.send_logs(text):
             self.log("send_logs requested: not sent (control socket closed)")
 
