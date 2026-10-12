@@ -48,6 +48,12 @@ jobs:
       - name: Tests (core, main, update)
         run: python -m pytest -q -rP   # -rP prints the COM stress verdict (old pattern: survived or crashed)
 
+      - name: "Noise suppression per-frame budget (500 frames, 95th percentile under 5 ms on windows-latest)"
+        shell: pwsh
+        env:
+          NS_BUDGET_STRICT: '1'
+        run: python -m pytest -q -s tests/test_ns.py::test_per_frame_budget
+
       - name: "Rollback restore helper (real cmd.exe + robocopy on temp folders; old files back, start line runs, failed restore leaves state untouched)"
         run: python -m pytest -v tests/test_guard_windows.py
 

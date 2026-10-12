@@ -36,6 +36,7 @@ micguard = _sibling("micguard")
 win_audio = _sibling("win_audio")
 vad = _sibling("vad")
 readiness = _sibling("readiness")
+ns = _sibling("ns")                 # numpy-only spectral noise suppression (config "ns")
 
 HOME = micguard.HOME                # %LOCALAPPDATA%\YoussefConnector (YOUSSEF_HOME overrides)
 DEFAULTS_BACKUP = HOME / "default-devices.json"   # normal default devices while the cable route has them switched
@@ -325,8 +326,13 @@ class _Source:
 
     def __init__(self, inner, owner):
         self.inner, self.owner, self.closed = inner, owner, False
+        self.ns = None
 
     def start(self, cb):
+        if self.owner.call_ns_mode() == "spectral":   # config "ns": callee microphone noise suppression, only once the core streams
+            self.ns = ns.SpectralNS()
+            tap = getattr(cb, "__self__", None)       # core hands in _Tap.push; frames are replaced only while tap.streaming
+            cb = ns.wrap_callback(cb, self.ns, lambda: bool(getattr(tap, "streaming", False)), self.owner.log)
         self.inner.start(cb)
 
     def alive(self) -> bool:
@@ -337,6 +343,8 @@ class _Source:
         if self.closed:
             return
         self.closed = True
+        if self.ns is not None:
+            self.owner.log("ns_stats", **self.ns.stats())
         try:
             self.inner.stop()
         finally:
@@ -387,6 +395,7 @@ class WinAudio(AudioAdapter):
 
     endpoint_volume = True   # config "endpoint_volume": false skips IdPlayer's max-volume step
     capture_volume = "off"   # config "capture_volume": "off" | "log" | "max": IdSource's Hands-Free microphone endpoint volume
+    ns = "off"               # config "ns": "off" | "spectral" (connector/ns.py); the server's remote_config.json "ns" overrides it per call
 
     def __init__(self, phone_adapter: WinPhone, gain: float = 1.0, loudness: bool = True, log=None):
         self.phone, self.gain, self.loudness = phone_adapter, float(gain), loudness
@@ -408,6 +417,16 @@ class WinAudio(AudioAdapter):
         if self._live == 0:
             win_audio.AUDIO_BUSY.clear()
             self.phone.cleanup()
+
+    def call_ns_mode(self) -> str:
+        """Noise suppression mode for this call: the server-pushed HOME/remote_config.json "ns" when present, else the local config."""
+        try:
+            rc = json.loads((HOME / "remote_config.json").read_text(encoding="utf-8"))
+            if isinstance(rc, dict) and "ns" in rc:
+                return ns.normalize_mode(rc["ns"])
+        except Exception:  # noqa: BLE001
+            pass
+        return ns.normalize_mode(self.ns)
 
     def source(self):
         cap = self._devs()[0]
@@ -466,6 +485,7 @@ def build(cfg: dict = None, log=None):
     ph, au, gate = make_adapters(cfg.get("audio_route") or "hf_direct", cfg.get("phone_mac") or "",
                                  cfg.get("in_gain", 1.0), cfg.get("loudness", True) is not False, log)
     au.endpoint_volume = cfg.get("endpoint_volume", True) is not False
+    au.ns = ns.normalize_mode(cfg.get("ns"))
     au.capture_volume = cfg.get("capture_volume") if cfg.get("capture_volume") in ("log", "max") else "off"
     ph.startup_cleanup()
     return ph, au, gate, ph.route
