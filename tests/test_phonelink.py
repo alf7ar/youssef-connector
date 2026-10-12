@@ -1,6 +1,7 @@
 """Phone Link launch (heal action phone_link_launch), plcall failure classification, and the one dial retry.
 subprocess, the Phone Link process check and the phone module are mocked; heal is a stub (owner H1 not merged yet)."""
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -35,9 +36,9 @@ class FakeClock:
 
 @pytest.fixture
 def clock(monkeypatch):
+    """Replaces the time module as seen by phonelink only (asyncio.run on Windows also calls the global time.sleep)."""
     c = FakeClock()
-    monkeypatch.setattr(phonelink.time, "monotonic", c.monotonic)
-    monkeypatch.setattr(phonelink.time, "sleep", c.sleep)
+    monkeypatch.setattr(phonelink, "time", types.SimpleNamespace(monotonic=c.monotonic, sleep=c.sleep))
     return c
 
 
@@ -160,7 +161,8 @@ class FakePhone:
 @pytest.fixture
 def dialer(monkeypatch):
     sleeps = []
-    monkeypatch.setattr(win_adapters.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(win_adapters, "time", types.SimpleNamespace(monotonic=time.monotonic,
+                                                                   sleep=lambda s: sleeps.append(s)))
 
     def make(results, call_active=False, active_after_first=False):
         fake = FakePhone(results, call_active, active_after_first)
