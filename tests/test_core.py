@@ -421,16 +421,17 @@ def test_auth_header_sent_on_both_sockets():
     run(go())
 
 
-def test_bad_token_rejected_4401_and_keeps_retrying():
+def test_bad_token_rejected_4401_retries_every_5_min_not_tight():
     async def go():
         hub = MockHub(token="good")
-        async with rig("answer", hub=hub, conn_token="old") as r:
+        async with rig("answer", hub=hub, conn_token="old", clock=RecClock(speed=2000)) as r:
             for _ in range(200):
                 if len(hub.headers_seen) >= 3:
                     break
                 await asyncio.sleep(0.02)
             assert len(hub.headers_seen) >= 3 and set(hub.headers_seen) == {"old"}
-            assert not hub.msgs and r.conn.stop_reason is None
+            assert not hub.msgs and r.conn.stop_reason is None and r.conn.token_rejected
+            assert cc.TOKEN_RETRY == 300.0 and set(r.clock.sleeps) == {cc.TOKEN_RETRY}   # never the 1..30 s backoff
     run(go())
 
 
@@ -443,16 +444,40 @@ def test_welcome_min_version_stops_connector():
     run(go())
 
 
-def test_replaced_by_new_connector_stops():
+def test_replaced_once_waits_60s_and_reconnects():
     async def go():
         hub = MockHub()
-        async with rig("answer", hub=hub) as r1:
+        async with rig("answer", hub=hub, clock=RecClock(speed=200)) as r1:
             await hub.wait_msg("hello")
             clock2 = RecClock()
             c2 = cc.Connector(hub.url, "tok", FakePhone(clock=clock2), FakeAudio(clock=clock2), FakeGate(), clock=clock2)
             t2 = asyncio.create_task(c2.run())
-            await asyncio.wait_for(r1.task, 5)
-            assert r1.conn.stop_reason == "replaced"
+            await asyncio.sleep(0.2)
+            c2.stop()
+            t2.cancel()
+            with contextlib.suppress(BaseException):
+                await t2
+            for _ in range(100):
+                if cc.REPLACED_WAIT in r1.clock.sleeps and len([1 for t, *_ in hub.msgs if t == "hello"]) >= 2:
+                    break
+                await asyncio.sleep(0.05)
+            assert cc.REPLACED_WAIT == 60.0 and cc.REPLACED_WAIT in r1.clock.sleeps
+            assert r1.conn.stop_reason is None and not r1.task.done()
+    run(go())
+
+
+def test_replaced_three_times_in_10_min_stops():
+    async def go():
+        hub = MockHub()
+        async with rig("answer", hub=hub, clock=RecClock(speed=200)) as r1:
+            await hub.wait_msg("hello")
+            clock2 = RecClock(speed=200)
+            c2 = cc.Connector(hub.url, "tok", FakePhone(clock=clock2), FakeAudio(clock=clock2), FakeGate(), clock=clock2)
+            t2 = asyncio.create_task(c2.run())      # two connectors that keep replacing each other
+            await asyncio.wait_for(asyncio.wait({r1.task, t2}, return_when=asyncio.FIRST_COMPLETED), 20)
+            stopped = [c for c in (r1.conn, c2) if c.stop_reason == "replaced"]
+            assert stopped, (r1.conn.stop_reason, c2.stop_reason)
+            assert len(stopped[0]._replaced_at) == cc.REPLACED_MAX == 3
             c2.stop()
             t2.cancel()
             with contextlib.suppress(BaseException):

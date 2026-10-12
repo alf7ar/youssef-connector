@@ -4,7 +4,9 @@ Speaks the hub protocol (control socket /connector/ws + per-call socket /call/{i
 drives the phone/audio through adapters. The Windows adapters (Phone Link / WASAPI) live elsewhere; connector/fakes.py
 has the fakes used by tests. Policy notes:
 - Control socket lost during a call: the call is hung up locally (the hub drops the call too after 30 s without hb).
-- Close code 4001 (replaced by a newer connector) or a welcome min_version above ours: run() returns, no reconnect fight.
+- Close code 4001 (replaced by a newer connector): wait REPLACED_WAIT s and reconnect; replaced REPLACED_MAX times within
+  REPLACED_WINDOW s = two connectors are fighting, so run() returns with stop_reason "replaced". A welcome min_version above ours
+  also stops run(). Close code 4401 (bad token): token_rejected is set and the retry is every TOKEN_RETRY s, not the short backoff.
 - Ended before answer: adapter hint `phone.end_hint()` (optional) wins; otherwise ringing <5 s -> busy, longer -> no_answer,
   never rang -> dial_failed. After answer: hint (e.g. call_ended) else callee_hangup.
 """
@@ -44,6 +46,10 @@ BUSY_RING_MAX = 5.0
 WS_PING_INTERVAL = 10.0  # s between websocket keepalive pings (both sockets); a silent network is noticed after at most
 WS_PING_TIMEOUT = 10.0   # interval + timeout + close timeout = 22 s, before the hub gives up on a connector without
 WS_CLOSE_TIMEOUT = 2.0   # heartbeats (30 s). The library defaults (20 + 20 + 10) would leave the phone line up for 50 s.
+REPLACED_WAIT = 60.0     # s to wait after being replaced (4001) before reconnecting
+REPLACED_MAX = 3         # replaced this many times within REPLACED_WINDOW = a fight with another connector: stop
+REPLACED_WINDOW = 600.0
+TOKEN_RETRY = 300.0      # s between reconnects while the hub rejects the token (4401)
 REASONS = {"callee_hangup", "call_ended", "no_answer", "busy", "no_speech", "dial_failed", "audio_error",
            "hangup_cmd", "agent_end"}
 _ABORT = object()
@@ -193,6 +199,9 @@ class Connector:
         self._call: Optional[_Call] = None
         self._tasks: set = set()
         self._welcomed = False
+        self.token_rejected = False                # the hub closed with 4401 (bad / rotated token); cleared by the next welcome
+        self.last_ready: Optional[dict] = None     # the ready dict of the latest heartbeat (keep-awake reads it)
+        self._replaced_at: list = []
 
     def stop(self):
         self.stopped = True
@@ -204,23 +213,41 @@ class Connector:
         while not self.stopped:
             self._welcomed = False
             ws = None
+            err = None
             try:
                 async with connect(self.base + "/connector/ws", additional_headers=self.headers, open_timeout=10,
                                    max_size=2 ** 22, ping_interval=WS_PING_INTERVAL, ping_timeout=WS_PING_TIMEOUT,
                                    close_timeout=WS_CLOSE_TIMEOUT) as ws:
                     await self._session(ws)
             except (OSError, websockets.WebSocketException, asyncio.TimeoutError) as e:
+                err = e
                 self.log("control connect/session failed:", repr(e))
             code = getattr(ws, "close_code", None) if ws is not None else None
-            if code == 4001:
-                self.stop_reason = "replaced"
-                return
             if self.stopped:
                 return
+            if code == 4001:
+                now = self.clock.now()
+                self._replaced_at = [t for t in self._replaced_at if now - t < REPLACED_WINDOW] + [now]
+                if len(self._replaced_at) >= REPLACED_MAX:
+                    self.stop_reason = "replaced"
+                    return
+                self.log("replaced by another connector; retrying in", REPLACED_WAIT, "s")
+                await self.clock.sleep(REPLACED_WAIT)
+                continue
+            if code == 4401 or self._rejected_http(err):
+                self.token_rejected = True
+                self.log("token rejected by the hub; retrying in", TOKEN_RETRY, "s")
+                await self.clock.sleep(TOKEN_RETRY)
+                continue
             if self._welcomed:
                 idx = 0
             await self.clock.sleep(BACKOFF[min(idx, len(BACKOFF) - 1)])
             idx += 1
+
+    @staticmethod
+    def _rejected_http(err) -> bool:
+        """True for a handshake refused with HTTP 401/403 (a hub or proxy that rejects the token before the upgrade)."""
+        return getattr(getattr(err, "response", None), "status_code", None) in (401, 403)
 
     async def _send(self, obj: dict, ws=None) -> bool:
         ws = ws or self._ws
@@ -265,6 +292,7 @@ class Connector:
                 reason = f"ready() failed: {e!r}"
                 ar, en = _reason_texts(reason)
                 ready = {"ok": False, "reason": reason, "reason_ar": ar, "reason_en": en, "warnings": []}
+            self.last_ready = ready
             if not await self._send({"type": "hb", "ready": ready}, ws):
                 return
             await self.clock.sleep(HB_EVERY)
@@ -273,6 +301,7 @@ class Connector:
         t = m.get("type")
         if t == "welcome":
             self._welcomed = True
+            self.token_rejected = False
             if _vtuple(self.version) < _vtuple(m.get("min_version", "0")):
                 self.stop_reason = "outdated"
                 self.stopped = True
