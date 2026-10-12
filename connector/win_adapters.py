@@ -36,6 +36,7 @@ micguard = _sibling("micguard")
 win_audio = _sibling("win_audio")
 vad = _sibling("vad")
 readiness = _sibling("readiness")
+phonelink = _sibling("phonelink")   # Phone Link launch + dial failure classification
 
 HOME = micguard.HOME                # %LOCALAPPDATA%\YoussefConnector (YOUSSEF_HOME overrides)
 DEFAULTS_BACKUP = HOME / "default-devices.json"   # normal default devices while the cable route has them switched
@@ -150,8 +151,17 @@ class WinPhone(PhoneAdapter):
             return False
         r = asyncio.run(phone.phone_link("dial", num))   # plcall.ps1 returns once Windows sees the call
         self._log("dial", number_tail=num[-4:], ok=r.get("ok"), error=r.get("error"), method=r.get("method"))
+        reason = None if r.get("ok") else phonelink.reason_for(r.get("error"))
+        if reason and not phone.call_flags().get("call_active"):   # Phone Link UI failure: one retry, no call is up
+            time.sleep(phonelink.RETRY_S)
+            r = asyncio.run(phone.phone_link("dial", num))
+            self._log("dial_retry", number_tail=num[-4:], ok=r.get("ok"), error=r.get("error"), first=reason)
+            reason = None if r.get("ok") else phonelink.reason_for(r.get("error"))
         if not r.get("ok"):
             self.last_error = str(r.get("error") or "Phone Link dial failed")
+            if reason:
+                self.last_error = f"{reason}: {self.last_error}"
+                phonelink.report(reason, error=self.last_error[:200])
             return False
         with self.lock:
             self._reset()

@@ -49,6 +49,8 @@ REASONS = {
     "battery_saver": ("وضع توفير البطارية شغال وبيبوّظ البلوتوث. اقفله أو وصّل الشاحن.",
                       "Battery saver is on and throttles Bluetooth. Turn it off or plug in the charger."),
     "phone_link_not_running": ("برنامج Phone Link مش شغال. افتحه من قايمة ابدأ.", "Phone Link is not running. Open it from the Start menu."),
+    "phone_link_not_linked": ("Phone Link مش متوصل بالآيفون. افتح Phone Link على اللابتوب وكمّل إعداد الآيفون.",
+                              "Phone Link is not linked to the iPhone. Open Phone Link on the laptop and finish the iPhone setup."),
     "bluetooth_off": ("البلوتوث مقفول على اللابتوب. شغّله.", "Bluetooth is off on the laptop. Turn it on."),
     "iphone_not_connected": ("الآيفون مش متوصل بالبلوتوث. شغّل البلوتوث على الآيفون وقرّبه من اللابتوب.",
                              "The iPhone is not connected over Bluetooth. Turn Bluetooth on on the iPhone and bring it close."),
