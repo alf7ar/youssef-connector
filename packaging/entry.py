@@ -1,11 +1,12 @@
 """PyInstaller entry point (keeps the `connector` package imports relative).
 The crash-loop guard runs first and imports only the stdlib-only guard: it records this start (and starts its heartbeat) BEFORE
-`connector.main` is imported, so a build that cannot even import still counts its starts and is rolled back after two."""
+`connector.main` is imported, so a build that cannot even import still counts its starts and is rolled back after two.
+`--supervise` (connector/supervisor.py) skips it: the supervisor only relaunches the app, whose own start is recorded by the guard."""
 import os
 import sys
 
 if __name__ == "__main__":
-    if not {"--version", "--selftest", "--e2e"} & set(sys.argv[1:]):
+    if not {"--version", "--selftest", "--e2e", "--supervise"} & set(sys.argv[1:]):
         try:
             from pathlib import Path
 

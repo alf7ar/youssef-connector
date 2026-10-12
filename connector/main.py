@@ -7,8 +7,11 @@ Flags: --selftest [--selftest-out FILE]  imports of every module, faulthandler, 
                                          connect code; exits 0/1 within 60 s (a hang dumps all stacks and exits)
        --e2e [--selftest-out FILE]       the real app flow (config, status page, core) with fake adapters against the mock hub
        --no-update                       skip the update check
+       --supervise                       keep the app running: start it as a child and relaunch it when it dies (connector/supervisor.py)
 Env (tests/CI only): YC_HOME (data dir), YC_UPDATE_URL (manifest override), YC_UPDATE_EVERY (seconds between update checks),
-YC_FAKE=1 (fake adapters), YC_PORT (status page port)."""
+YC_FAKE=1 (fake adapters), YC_PORT (status page port), YC_SUPERVISED=1 (set by --supervise for its child: distinct exit codes).
+Exit codes: 0 everything else that is clean; EXIT_UPDATE / EXIT_REPLACED only under YC_SUPERVISED=1 (otherwise 0, as before);
+1 fatal error. The supervisor does not relaunch after 0, EXIT_UPDATE or EXIT_REPLACED."""
 import asyncio
 import base64
 import contextlib
@@ -32,6 +35,14 @@ from . import guard, logsend, update
 MUTEX = guard.MUTEX
 PORT = 5076
 UA = "YoussefConnector/1"
+EXIT_UPDATE = 10      # an update installer was launched: the installer replaces the files and starts the new version
+EXIT_REPLACED = 11    # another connector took over this token: relaunching would make the two fight over it
+SUPERVISOR_STOP = {0: "clean exit", EXIT_UPDATE: "update", EXIT_REPLACED: "replaced by another connector"}
+
+
+def exit_code(code: int) -> int:
+    """EXIT_UPDATE / EXIT_REPLACED are only reported to a supervisor (YC_SUPERVISED=1); a plain run still exits 0."""
+    return code if os.environ.get("YC_SUPERVISED") == "1" else 0
 
 
 # ------------------------------------------------------------------ paths / config / connect code (pure)
@@ -182,6 +193,7 @@ class App:
         self.stop_event = threading.Event()
         self.message = ""
         self.exit_for_update = False
+        self.replaced = False
         self.port = 0
 
     def configured(self) -> bool:
@@ -342,6 +354,7 @@ class App:
                 await asyncio.sleep(60)
             elif self.conn.stop_reason == "replaced":
                 self.message = "تم تشغيل موصل آخر / Another connector took over"
+                self.replaced = True
                 return
 
 
@@ -445,7 +458,7 @@ def selftest(out: Path = None) -> int:
 
     def imports():
         import numpy, onnxruntime, soxr, websockets  # noqa: F401,E401
-        mods = ["core", "fakes", "vad", "update", "readiness", "micguard", "comstress"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
+        mods = ["core", "fakes", "vad", "update", "readiness", "micguard", "comstress", "supervisor"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
         for m in mods:
             importlib.import_module(f"{__package__ or 'connector'}.{m}")
         return f"version {read_version()}, {len(mods)} connector modules"
@@ -559,6 +572,10 @@ def main(argv=None) -> int:
         return selftest(out)
     if "--e2e" in argv:
         return e2e(out)
+    if "--supervise" in argv:
+        from . import supervisor
+        home = app_home()
+        return supervisor.main(argv, home, read_version(), make_logger(home), SUPERVISOR_STOP)
     if not single_instance():
         return 0
     home = app_home()
@@ -572,7 +589,7 @@ def main(argv=None) -> int:
     log(f"Youssef Connector {version} status page http://127.0.0.1:{port}/")
     if "--no-update" not in argv and app.try_update():
         guard.mark_clean(home)
-        return 0     # the installer closes/replaces files and relaunches the new version
+        return exit_code(EXIT_UPDATE)     # the installer closes/replaces files and relaunches the new version
     if not app.configured():
         with contextlib.suppress(Exception):
             webbrowser.open(f"http://127.0.0.1:{port}/")
@@ -584,6 +601,10 @@ def main(argv=None) -> int:
         log("fatal: " + traceback.format_exc())
         return 1
     guard.mark_clean(home)
+    if app.exit_for_update:
+        return exit_code(EXIT_UPDATE)
+    if app.replaced:
+        return exit_code(EXIT_REPLACED)
     return 0
 
 

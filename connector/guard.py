@@ -255,6 +255,41 @@ def start_heartbeat(home: Path, stop: threading.Event = None, is_shutting_down=N
     return stop
 
 
+SUPERVISED_MAX_DEATHS = 5   # consecutive fast deaths after which the supervisor stops relaunching (no backup to roll back to)
+INSTALL_GRACE_S = 180       # an installer launched this recently is still replacing files
+RESTORE_GRACE_S = 300       # staged rollback files this fresh mean restore.cmd is (about to be) running
+
+
+def _fresh(p: Path, within: float, now: float) -> bool:
+    try:
+        return now - p.stat().st_mtime < within
+    except OSError:
+        return False
+
+
+def ok_to_restart(home: Path, version: str, now: float = None, boot: float = None, can_rollback: bool = None) -> tuple:
+    """(ok, reason): may the supervisor relaunch the app after an unexpected exit? The death count and the rollback stay here.
+    False while an update installer is running (update_state.json written just before it launched) or a rollback restore is
+    staged / running (restore.cmd starts the old exe itself), and once SUPERVISED_MAX_DEATHS fast deaths in a row happened with
+    no rollback to fall back on. True with reason "rollback_due" when the next start will roll back (begin() does it)."""
+    now = time.time() if now is None else now
+    boot = boot_time() if boot is None else boot
+    st = _read(home / "update_state.json")
+    try:
+        if now - float(st.get("ts", 0)) < INSTALL_GRACE_S:
+            return False, "update_installing"
+    except (TypeError, ValueError):
+        pass
+    if any(_fresh(home / n, RESTORE_GRACE_S, now) for n in (PENDING_ROLLED, PENDING_GUARD)):
+        return False, "rollback_pending"
+    deaths = pending_deaths(_read(home / "guard.json"), version, now, boot)
+    if deaths >= LOOP_DEATHS and rollback_due(home, version, now, boot) and (frozen() if can_rollback is None else can_rollback):
+        return True, "rollback_due"
+    if deaths >= SUPERVISED_MAX_DEATHS:
+        return False, "crash_loop"
+    return True, "ok"
+
+
 def begin(home: Path, version: str, running: bool = None, can_rollback: bool = None, now: float = None, spawn=_spawn) -> str:
     """The first thing a start does (packaging/entry.py, before `connector.main` is imported). Returns
     "other"    another instance is running: nothing is recorded (main() exits at once on the mutex),
