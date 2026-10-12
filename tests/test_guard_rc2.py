@@ -1,5 +1,6 @@
 """0.1.2-rc2 crash-loop guard fixes (Linux fakes): import-broken builds count their starts, a quick restart is still a death,
 a restart / Windows shutdown is not, the restore helper checks robocopy, min_version understands release candidates."""
+import asyncio
 import json
 import subprocess
 import sys
@@ -171,3 +172,17 @@ def test_min_version_understands_release_candidates():
     assert core._vtuple("0.1.2-rc1") < core._vtuple("0.1.2")
     assert core._vtuple("0.1.2-rc2") > core._vtuple("0.1.2-rc1")
     assert core._vtuple("0.1.2-rc1") >= core._vtuple("0.0.0") and core._vtuple("0.1.1") >= core._vtuple("0")
+
+
+@pytest.mark.parametrize("version,min_version,outdated", [
+    ("0.1.2-rc1", "0.1.1", False),      # the hub's MIN_CONNECTOR_VERSION 0.1.1 must not stop an rc connector (it parsed as 0.1.0)
+    ("0.1.2-rc1", "0.1.2", True),       # an rc is older than its release
+    ("0.1.2-rc2", "0.1.2-rc10", True),  # rc numbers compare as numbers
+    ("0.1.2-rc10", "0.1.2-rc2", False),
+    ("0.1.0", "0.1", False), ("0.1", "0.1.0", False), ("0.1.1", "0.1.1", False),   # plain versions unchanged
+    ("0.1.1", "0.1.2", True), ("1.0.0", "0.9.9", False), ("0.1.10", "0.1.9", False), ("0.1.2", "0.1.2-rc1", False),
+])
+def test_welcome_min_version_is_rc_aware(version, min_version, outdated):
+    conn = core.Connector("ws://x", "tok", None, None, None, version=version)
+    asyncio.run(conn._on_control({"type": "welcome", "min_version": min_version}))
+    assert (conn.stop_reason == "outdated") is outdated
