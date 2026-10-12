@@ -38,6 +38,7 @@ vad = _sibling("vad")
 readiness = _sibling("readiness")
 _app_log = lambda *a, **k: None   # build(log=...) sets the app logger; never print() (lost in the frozen exe)
 heal = _sibling("heal")
+callhealth = _sibling("callhealth")   # post-call Bluetooth health (bt_recovering) and the hang-up fallback
 
 HOME = micguard.HOME                # %LOCALAPPDATA%\YoussefConnector (YOUSSEF_HOME overrides)
 DEFAULTS_BACKUP = HOME / "default-devices.json"   # normal default devices while the cable route has them switched
@@ -122,6 +123,8 @@ class WinPhone(PhoneAdapter):
         self.last_transfer = 0.0
         self.stuck_logged = False
         self.active = False     # call audio is on the laptop and the devices are chosen
+        self.hf_seen = False    # both Hands-Free endpoints were up (audio setup started): Bluetooth is fine from then on
+        self.pending_end = None  # (hint, stuck, audio_was_up) for callhealth.on_call_end, run outside self.lock
         self.was_active = False
         self.off_since = None   # since when Windows says the call is not active
         self.hf_gone_since = None
@@ -138,7 +141,7 @@ class WinPhone(PhoneAdapter):
     def ready(self) -> dict:
         if self.t_dial is not None and not self.ended:
             return readiness.decorate({"ok": False, "reason": "call_active", "call_active": True})
-        return readiness.check(self.mac, self._log)
+        return callhealth.apply_ready(readiness.check(self.mac, self._log))   # bt_recovering after a call whose audio failed
 
     def busy(self) -> bool:
         """A call is up (ours, or one Windows sees on the line, incoming included): the heal engine must not touch Bluetooth."""
@@ -183,11 +186,14 @@ class WinPhone(PhoneAdapter):
             if self.ended:
                 return "ended"
             now = time.monotonic()
-            return self._in_call(now) if self.active else self._before_audio(now)
+            st = self._in_call(now) if self.active else self._before_audio(now)
+            pending, self.pending_end = self.pending_end, None
+        self._flush_end(pending)
+        return st
 
     def hangup(self) -> None:
         try:
-            r = phone.end_calls()
+            r = callhealth.hangup(phone, self._log)   # phone.end_calls(), then the Phone Link button if the call stays live
         except Exception as e:  # noqa: BLE001
             r = {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
         self._log("phone_hangup", **r)
@@ -221,7 +227,20 @@ class WinPhone(PhoneAdapter):
     def _end(self, hint):
         self.ended, self.hint = True, hint
         self._restore()
+        self.pending_end = (hint, self.stuck_logged, self.active or self.hf_seen)
         return "ended"
+
+    def _flush_end(self, pending=None):
+        """audio_error / hf_link_stuck: heal report + bt_recovering. Never under self.lock (the heal engine takes its own lock
+        and calls back into the app; the two orders would deadlock)."""
+        if pending is None:
+            with self.lock:
+                pending, self.pending_end = self.pending_end, None
+        if pending:
+            try:
+                callhealth.on_call_end(*pending, self._log)
+            except Exception as e:  # noqa: BLE001
+                self._log("call_end_health_failed", error=f"{type(e).__name__}: {e}"[:150])
 
     def _restore(self):
         try:
@@ -294,6 +313,7 @@ class WinPhone(PhoneAdapter):
         return "ringing" if live else "idle"
 
     def _activate(self, hf: dict, now: float) -> str:
+        self.hf_seen = True
         try:
             if self.route == "cable":
                 ii, oi, info = win_audio.find_cable_devices()
