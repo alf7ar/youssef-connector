@@ -5,6 +5,10 @@ import os
 import sys
 
 if __name__ == "__main__":
+    if {"--install-repair", "--uninstall-repair"} & set(sys.argv[1:]):
+        # elevated one-shot from the installer (UAC): no crash guard, no app, no single-instance check
+        from connector import repair_setup
+        sys.exit(repair_setup.main(sys.argv[1:]))
     if not {"--version", "--selftest", "--e2e"} & set(sys.argv[1:]):
         try:
             from pathlib import Path

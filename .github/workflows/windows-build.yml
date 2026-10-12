@@ -68,6 +68,109 @@ jobs:
           if (-not $done) { throw 'built exe --selftest exceeded 60 s' }
           if ($p.ExitCode -ne 0) { throw "built exe selftest exit code $($p.ExitCode)" }
 
+      - name: "Elevated repair task (built exe --install-repair: SYSTEM task, ACLs, task SD, fake + SYSTEM + standard-user runs, --uninstall-repair)"
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          $exe = 'dist\YoussefConnector\YoussefConnector.exe'
+          $out = Join-Path $env:RUNNER_TEMP 'repair-setup.txt'
+          $base = Join-Path $env:ProgramData 'YoussefConnector'
+          $dir = Join-Path $base 'repair'
+          $ps1 = Join-Path $dir 'repair.ps1'
+          $lj = Join-Path $dir 'last.json'
+          $users = New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-545'
+          $admin = @('S-1-5-18', 'S-1-5-32-544')
+          $write = [Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteExtendedAttributes, WriteAttributes, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
+          $rx = [Security.AccessControl.FileSystemRights]::ReadAndExecute
+          function Setup($flag) {
+            $p = Start-Process -FilePath $exe -ArgumentList $flag, '--selftest-out', $out -Wait -PassThru
+            if (Test-Path $out) { Get-Content $out } else { Write-Host 'NO SETUP OUTPUT' }
+            if ($p.ExitCode -ne 0) { throw "$flag exit code $($p.ExitCode)" }
+          }
+          function Assert-Acl($path, $protected) {
+            $acl = Get-Acl -LiteralPath $path
+            $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+            $rules | ForEach-Object { Write-Host "  $path $($_.IdentityReference) $($_.AccessControlType) $($_.FileSystemRights) inherited=$($_.IsInherited)" }
+            if ($protected -and -not $acl.AreAccessRulesProtected) { throw "$path inherits ACEs" }
+            $bad = @($rules | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -notin $admin -and ($_.FileSystemRights -band $write) })
+            if ($bad.Count) { throw "$path grants write to $($bad.IdentityReference.Value -join ',')" }
+            $ok = @($rules | Where-Object { $_.IdentityReference -eq $users -and $_.AccessControlType -eq 'Allow' -and (($_.FileSystemRights -band $rx) -eq $rx) })
+            if (-not $ok.Count) { throw "$path is not readable by Users" }
+          }
+          function Wait-Newer($since, $what) {
+            $deadline = (Get-Date).AddSeconds(120)
+            while ((Get-Date) -lt $deadline) {
+              if ((Test-Path $lj) -and (Get-Item $lj).LastWriteTimeUtc -gt $since) { Start-Sleep 1; return (Get-Content $lj -Raw | ConvertFrom-Json) }
+              Start-Sleep 2
+            }
+            Get-ScheduledTaskInfo -TaskName YoussefRepair | Format-List | Out-Host
+            throw "$what wrote no new last.json"
+          }
+
+          if (Get-ScheduledTask -TaskName YoussefRepair -ErrorAction SilentlyContinue) { throw 'task exists before install' }
+          Setup '--install-repair'
+          $t = Get-ScheduledTask -TaskName YoussefRepair
+          $trig = @($t.Triggers | Where-Object { $null -ne $_ })
+          Write-Host "principal $($t.Principal.UserId) $($t.Principal.LogonType) $($t.Principal.RunLevel); action $($t.Actions[0].Execute) $($t.Actions[0].Arguments); triggers $($trig.Count)"
+          if ($t.Principal.UserId -notin @('SYSTEM', 'S-1-5-18') -or "$($t.Principal.RunLevel)" -ne 'Highest') { throw 'task principal is not SYSTEM / Highest' }
+          if (@($t.Actions).Count -ne 1 -or $t.Actions[0].Arguments -ne ('-NoProfile -ExecutionPolicy Bypass -File "' + $ps1 + '"') -or $t.Actions[0].Execute -notlike '*\WindowsPowerShell\v1.0\powershell.exe') { throw 'unexpected task action' }
+          if ($trig.Count) { throw 'task has triggers' }
+          $svc = New-Object -ComObject Schedule.Service; $svc.Connect()
+          $sd = $svc.GetFolder('\').GetTask('YoussefRepair').GetSecurityDescriptor(4)
+          Write-Host "task sddl $sd"
+          $raw = New-Object Security.AccessControl.RawSecurityDescriptor $sd
+          if (-not @($raw.DiscretionaryAcl | Where-Object { $_.SecurityIdentifier -eq $users }).Count) { throw 'task SD has no Users ACE' }
+          foreach ($a in $raw.DiscretionaryAcl) {
+            if ($a.SecurityIdentifier.Value -notin $admin -and "$($a.AceQualifier)" -eq 'AccessAllowed' -and ($a.AccessMask -band 0x500D0006)) { throw "task SD grants write to $($a.SecurityIdentifier)" }
+          }
+          foreach ($p in @($base, $dir, $ps1)) { Assert-Acl $p $true }
+
+          # FAKE mode, run directly as the (admin) runner: discovery only, nothing restarted, last.json redirected
+          $fo = Join-Path $env:RUNNER_TEMP 'repair-fake'
+          New-Item -ItemType Directory -Force $fo | Out-Null
+          $env:YOUSSEF_REPAIR_FAKE = '1'; $env:YOUSSEF_REPAIR_OUT = $fo
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $ps1
+          Write-Host "fake run rc $LASTEXITCODE"
+          Remove-Item Env:YOUSSEF_REPAIR_FAKE, Env:YOUSSEF_REPAIR_OUT
+          $fj = Get-Content (Join-Path $fo 'last.json') -Raw
+          Write-Host $fj
+          $j = $fj | ConvertFrom-Json
+          if (-not $j.fake -or $j.rc -notin @(0, 2) -or -not $j.time -or @($j.steps).Count -lt 3) { throw 'fake last.json incomplete' }
+          if (@($j.steps | Where-Object { "$($_.detail)" -like 'pnputil*' }).Count) { throw 'fake run called pnputil' }
+          if (Test-Path $lj) { throw 'fake run wrote into the repair folder' }
+
+          # the real task as SYSTEM (runner has no USB/PCI Bluetooth adapter: rc 2, services restarted when present)
+          schtasks.exe /run /tn YoussefRepair | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "schtasks /run rc $LASTEXITCODE" }
+          $j = Wait-Newer ([datetime]::MinValue) 'SYSTEM run'
+          Get-Content $lj -Raw | Out-Host
+          if ($j.fake -or "$($j.user)" -notmatch 'SYSTEM$' -or $null -eq $j.rc) { throw "unexpected SYSTEM last.json (user $($j.user))" }
+          Assert-Acl $lj $false
+
+          # a standard user may start it (read + run rights on the task); infra problems with -Credential only warn
+          $pw = 'Yc!' + [guid]::NewGuid().ToString('N').Substring(0, 16) + 'a9'
+          net user tester $pw /add /y | Out-Null
+          try {
+            $cred = New-Object PSCredential('tester', (ConvertTo-SecureString $pw -AsPlainText -Force))
+            $since = (Get-Item $lj).LastWriteTimeUtc
+            $sp = $null
+            try { $sp = Start-Process -FilePath "$env:SystemRoot\System32\schtasks.exe" -ArgumentList '/run', '/tn', 'YoussefRepair' -Credential $cred -WorkingDirectory "$env:SystemRoot\System32" -WindowStyle Hidden -Wait -PassThru }
+            catch { Write-Host "::warning::standard-user run not possible on this runner: $($_.Exception.Message)" }
+            if ($sp) {
+              Write-Host "standard user schtasks /run exit $($sp.ExitCode)"
+              if ($sp.ExitCode -ne 0) { throw "standard user could not run the task (exit $($sp.ExitCode))" }
+              $null = Wait-Newer $since 'standard-user run'
+              Write-Host 'standard user started the SYSTEM task'
+            }
+          } finally { net user tester /delete | Out-Null }
+
+          Setup '--uninstall-repair'
+          if (Get-ScheduledTask -TaskName YoussefRepair -ErrorAction SilentlyContinue) { throw 'task still present after --uninstall-repair' }
+          if (Test-Path $base) { throw "$base still present after --uninstall-repair" }
+          Setup '--uninstall-repair'   # idempotent
+          Setup '--install-repair'     # left installed: the Inno uninstaller must remove it (checked in the Uninstall step)
+          if (-not (Get-ScheduledTask -TaskName YoussefRepair -ErrorAction SilentlyContinue)) { throw 'reinstall failed' }
+
       - name: Inno Setup compile
         shell: pwsh
         run: |
@@ -126,9 +229,14 @@ jobs:
           $dir = "$env:LOCALAPPDATA\Programs\YoussefConnector"
           $up = Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -PassThru
           $up.WaitForExit()
+          # unins000.exe re-launches itself from temp, and the elevated repair-task removal runs first: poll, not a fixed sleep
+          $deadline = (Get-Date).AddSeconds(90)
+          while ((Get-Date) -lt $deadline -and ((Test-Path "$dir\YoussefConnector.exe") -or (Get-ScheduledTask -TaskName YoussefRepair -ErrorAction SilentlyContinue))) { Start-Sleep 2 }
           Start-Sleep 3
           if (Test-Path "$dir\YoussefConnector.exe") { throw 'uninstall left the exe behind' }
-          Write-Host 'uninstalled'
+          if (Get-ScheduledTask -TaskName YoussefRepair -ErrorAction SilentlyContinue) { throw 'uninstall left the YoussefRepair task behind' }
+          if (Test-Path "$env:ProgramData\YoussefConnector") { throw 'uninstall left ProgramData\YoussefConnector behind' }
+          Write-Host 'uninstalled (app, repair task, repair folder)'
 
       - uses: actions/upload-artifact@v4
         with:
