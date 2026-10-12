@@ -33,8 +33,18 @@ def _sibling(name):
         return None
 
 
-heal = _sibling("heal")     # owner H1; None until it is merged (tests inject a stub)
-phone = _sibling("phone")   # needs the Windows-only winrt packages
+# Resolved lazily (first use): importing phone/heal pulls in winrt, which must load AFTER onnxruntime (PORT_NOTES.md), and
+# main.py imports this module at start-up. Tests set these to a stub or None.
+_UNSET = object()
+heal = _UNSET    # owner H1; None when it is not merged
+phone = _UNSET   # needs the Windows-only winrt packages
+
+
+def _get(name):
+    g = globals()
+    if g[name] is _UNSET:
+        g[name] = _sibling(name)
+    return g[name]
 
 
 def pick_candidates(devices) -> list:
@@ -178,6 +188,7 @@ class Pairer:
                     self._next_at = self.clock() + NO_PHONE_EVERY_S
                     return "has_phone"
             res = asyncio.run(self.attempt("add_phone" if adding else "no_phone"))
+            adding = self.add_window_open()    # re-read: a press during the attempt must not be pushed back to AFTER_ATTEMPT_S
             gap = ADD_SCAN_EVERY_S if adding else (NO_PHONE_EVERY_S if res == "no_candidate" else AFTER_ATTEMPT_S)
             self._next_at = self.clock() + gap
             return res
@@ -208,14 +219,16 @@ class _Cand:
 
 
 def _report_paired():
-    if heal is not None:
-        heal.report("iphone_not_connected", source="pairing")
+    h = _get("heal")
+    if h is not None:
+        h.report("iphone_not_connected", source="pairing")
 
 
 def _default_has_phone() -> bool:
-    if phone is None:
+    ph = _get("phone")
+    if ph is None:
         raise RuntimeError("phone module unavailable")
-    return bool(asyncio.run(phone.find_iphone_mac()))
+    return bool(asyncio.run(ph.find_iphone_mac()))
 
 
 async def _default_scan() -> list:
@@ -229,7 +242,7 @@ async def _default_scan() -> list:
         try:
             d = await BluetoothDevice.from_id_async(di.id)
             if d is not None:
-                is_phone = d.bluetooth_class_of_device.major_class == BluetoothMajorClass.PHONE
+                is_phone = d.class_of_device.major_class == BluetoothMajorClass.PHONE
                 d.close()
         except Exception:  # noqa: BLE001
             pass

@@ -276,3 +276,23 @@ def test_add_phone_refused_during_a_call(tmp_path):
     app.in_call = lambda: True
     ok, _ = app.add_phone()
     assert ok is False and not app.pairer.add_window_open()
+
+
+def test_add_phone_pressed_during_an_attempt_is_not_pushed_back():
+    p, clk, pairs, scans, rep = make(has=False, cands=[], pair_ok=False)
+
+    async def scan():
+        p.request_add_phone()          # pressed while the no-phone scan is running
+        return []
+    p.scan = scan
+    assert p.tick() == "no_candidate"
+    assert p._next_at == clk.t + pr.ADD_SCAN_EVERY_S
+
+
+def test_importing_pairing_does_not_load_phone_or_winrt():
+    """winrt must load after onnxruntime (PORT_NOTES.md), so importing pairing at app start must stay winrt-free."""
+    import subprocess
+    root = Path(__file__).resolve().parents[1]
+    code = "import sys; import connector.pairing; bad=[m for m in sys.modules if m=='connector.phone' or m.startswith('winrt')]; print(bad)"
+    out = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=60)
+    assert out.stdout.strip() == "[]", out
