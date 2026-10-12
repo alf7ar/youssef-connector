@@ -782,3 +782,97 @@ def test_dns_fallback_for_call_socket(monkeypatch):
                 await task
             await hub.stop()
     run(go())
+
+
+# ---- R-c9: DNS fallback vs proxy / bad cache values --------------------------------------------------------------------
+def _stop_after(conn, clock, n):
+    orig = clock.sleep
+
+    async def sleep(s):
+        await orig(s)
+        if len(clock.sleeps) >= n:
+            conn.stop()
+    clock.sleep = sleep
+
+
+def test_dns_failure_through_proxy_no_typeerror_normal_backoff(monkeypatch, tmp_path):
+    """R-c9: with a proxy set, a gaierror (the proxy's own name) must not take the IP fallback (host= twice -> TypeError
+    killed the run task) and must back off normally; the real websockets.connect goes through the proxy path here."""
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("http_proxy", "http://proxy.invalid:3128")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    assert cc._proxy_for("ws://hub.test:1/connector/ws") is not None
+    real, calls = cc.connect, []
+    monkeypatch.setattr(cc, "connect", lambda url, **kw: calls.append(dict(kw)) or real(url, **kw))
+
+    async def go():
+        clock = RecClock(speed=1000)
+        conn = cc.Connector("ws://hub.test:1", "tok", FakePhone(clock=clock), FakeAudio(clock=clock), FakeGate(), clock=clock,
+                            home=tmp_path)
+        conn._dns_cache["hub.test"] = "127.0.0.1"
+        _stop_after(conn, clock, 3)
+        await asyncio.wait_for(conn.run(), 30)                       # returns (no TypeError escapes run())
+        assert len(clock.sleeps) == 3 and all("host" not in kw for kw in calls)
+        lo, hi = cc.DNS_JITTER
+        for got, base in zip(clock.sleeps, cc.BACKOFF):
+            assert base * lo <= got <= base * hi
+    run(go())
+
+
+def test_dns_fallback_passes_proxy_none(monkeypatch, tmp_path):
+    async def go():
+        calls = _fake_dns(monkeypatch, resolves=False)
+        hub = MockHub()
+        await hub.start()
+        clock = RecClock()
+        conn = cc.Connector(f"ws://hub.test:{hub.port}", "tok", FakePhone(clock=clock), FakeAudio(clock=clock), FakeGate(True),
+                            clock=clock, host="testhost", home=tmp_path)
+        conn._dns_cache["hub.test"] = "127.0.0.1"
+        task = asyncio.create_task(conn.run())
+        try:
+            await _until_true(lambda: conn._welcomed)
+            assert calls[1][1]["host"] == "127.0.0.1" and calls[1][1]["proxy"] is None
+        finally:
+            conn.stop()
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+            await hub.stop()
+    run(go())
+
+
+def test_invalid_cached_dns_values_are_ignored(monkeypatch):
+    for bad in (123, ["127.0.0.1"], "not-an-ip", "", None):
+        calls = _fake_dns(monkeypatch, resolves=False)
+
+        async def go():
+            clock = RecClock(speed=1000)
+            conn = cc.Connector("ws://hub.test:1", "tok", FakePhone(clock=clock), FakeAudio(clock=clock), FakeGate(), clock=clock)
+            conn._dns_cache["hub.test"] = bad
+            _stop_after(conn, clock, 2)
+            await asyncio.wait_for(conn.run(), 30)
+            assert all("host" not in kw for _, kw in calls), bad
+        run(go())
+
+
+def test_proxied_connect_does_not_cache_the_proxy_ip(monkeypatch, tmp_path):
+    async def go():
+        monkeypatch.setattr(cc, "_proxy_for", lambda url: "http://proxy.test:3128")
+        _fake_dns(monkeypatch, resolves=True)
+        hub = MockHub()
+        await hub.start()
+        clock = RecClock()
+        conn = cc.Connector(f"ws://hub.test:{hub.port}", "tok", FakePhone(clock=clock), FakeAudio(clock=clock), FakeGate(True),
+                            clock=clock, host="testhost", home=tmp_path)
+        task = asyncio.create_task(conn.run())
+        try:
+            await _until_true(lambda: conn._welcomed)
+            assert conn._dns_cache == {} and not (tmp_path / "dns_cache.json").exists()
+        finally:
+            conn.stop()
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+            await hub.stop()
+    run(go())

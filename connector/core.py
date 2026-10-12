@@ -71,6 +71,26 @@ def _is_dns_error(e: BaseException) -> bool:
     return False
 
 
+def _proxy_for(url: str):
+    """The proxy websockets would use for url (HTTPS_PROXY / system settings), None when none applies or it cannot tell."""
+    try:
+        from websockets.uri import get_proxy, parse_uri
+        return get_proxy(parse_uri(url))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _valid_ip(v):
+    """v when it is an IPv4/IPv6 literal string (dns_cache.json is a file on disk: anything else is ignored), else None."""
+    if not isinstance(v, str):
+        return None
+    try:
+        socket.inet_pton(socket.AF_INET6 if ":" in v else socket.AF_INET, v)
+    except (OSError, ValueError):
+        return None
+    return v
+
+
 def _heal_report(failure: str, **detail):
     """Tell the self-heal module (connector/heal.py, optional) about a failure; never raises."""
     try:
@@ -284,20 +304,23 @@ class Connector:
         be resolved (gaierror) and a previous connection to that host succeeded, retry once through the remembered IP: TCP goes to
         the IP while TLS SNI / certificate check / Host header still use the hostname from the URL."""
         host = urlsplit(url).hostname or ""
+        proxied = _proxy_for(url) is not None   # through a proxy: the gaierror is the proxy's name, remote_address the proxy's IP
         try:
             ws = await connect(url, **kw)
         except OSError as e:
             if not _is_dns_error(e):
                 raise
             self._last_dns_fail = True
-            ip = self._dns_cache.get(host)
+            ip = None if proxied else _valid_ip(self._dns_cache.get(host))
             _heal_report("net_dns", host=host, cached_ip=bool(ip))
-            self.log("dns failed for", host, "-", "retrying via last good ip" if ip else "no cached ip")
+            self.log("dns failed for", host, "-", "via proxy: no ip fallback" if proxied else
+                     "retrying via last good ip" if ip else "no cached ip")
             if not ip:
                 raise
-            ws = await connect(url, host=ip, **kw)
+            ws = await connect(url, host=ip, proxy=None, **kw)
         else:
-            self._remember_ip(host, ws)
+            if not proxied:
+                self._remember_ip(host, ws)
         return ws
 
     def _remember_ip(self, host: str, ws):
