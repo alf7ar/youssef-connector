@@ -93,6 +93,8 @@ def test_mask_mac():
 
 def test_list_phones_without_winrt_returns_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "connector.phone", None)  # import raises ImportError
+    monkeypatch.delattr(sys.modules["connector"], "phone", raising=False)  # else `from . import phone` reuses the real one
+    monkeypatch.setitem(sys.modules, "onnxruntime", types.ModuleType("onnxruntime"))  # never the real DLLs after winrt
     phones, err = cm._list_phones()
     assert phones == [] and err
 

@@ -50,7 +50,7 @@ jobs:
           python -m pip install -r packaging/requirements-win.txt
 
       - name: Tests (core, main, update)
-        run: python -m pytest -q -rP   # -rP prints the COM stress verdict (old pattern: survived or crashed)
+        run: python -m pytest -v -rP   # -rP prints the COM stress verdict (old pattern: survived or crashed)
 
       - name: "Rollback restore helper (real cmd.exe + robocopy on temp folders; old files back, start line runs, failed restore leaves state untouched)"
         run: python -m pytest -v tests/test_guard_windows.py
