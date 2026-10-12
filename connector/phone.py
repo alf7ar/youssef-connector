@@ -50,33 +50,80 @@ async def bt_radio(turn_on: bool = False) -> dict:
 
 
 _find_err = [None]
+HFAG_SHORT = "0000111f"   # HandsfreeAG service class (a phone that can place calls for the laptop)
+PHONE_MAJOR_CLASS = 2     # Bluetooth class-of-device major class "Phone"
+# what the last find_iphone_mac scan saw: ok False = the scan failed (not "no phone"), candidates = phones found
+scan_info = {"ok": None, "candidates": None}
+_known = {"mac": "", "name": ""}   # the phone iphone()/find_iphone_mac() looked at last: used to pick its Hands-Free endpoints
+
+
+def _fmt_mac(address: int) -> str:
+    a = f"{address:012X}"
+    return ":".join(a[i:i + 2] for i in range(0, 12, 2))
+
+
+async def _is_phone(d, name: str) -> bool:
+    """A paired device is a phone candidate when its name has "iphone", its class of device is Phone, or it exposes the
+    HandsfreeAG (0x111F) service. Each probe failing counts as "no" (fakes/old Windows lack some of the properties)."""
+    if "iphone" in (name or "").lower():
+        return True
+    try:
+        if int(d.class_of_device.major_class) == PHONE_MAJOR_CLASS:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from winrt.windows.devices.bluetooth import BluetoothCacheMode
+        # pywinrt 3.x names the cache-mode overload get_rfcomm_services_with_cache_mode_async (see find_iphone_mac)
+        get = getattr(d, "get_rfcomm_services_with_cache_mode_async", None) or d.get_rfcomm_services_async
+        res = await get(BluetoothCacheMode.CACHED)
+        return any(HFAG_SHORT in str(s.service_id.uuid).lower() for s in res.services)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 async def find_iphone_mac() -> str:
-    """MAC of a paired classic-Bluetooth device whose name contains "iPhone" ("" if none). Several iPhones may be paired:
-    the one that is CONNECTED now wins, else the first found. A failure is logged once (not swallowed)."""
+    """MAC of a paired classic-Bluetooth phone ("" if none): a device named "iPhone", of class Phone, or exposing the
+    HandsfreeAG service. Several may be paired: the one that is CONNECTED now wins, else the first found. A failure is logged
+    once (not swallowed); scan_info says whether the scan worked and how many candidates it saw."""
     from winrt.windows.devices.enumeration import DeviceInformation
-    first = ""
+    first, first_name, found = "", "", 0
+    scan_info["ok"], scan_info["candidates"] = False, 0
     try:
         sel = BluetoothDevice.get_device_selector_from_pairing_state(True)
         # pywinrt 3.x names the selector overload find_all_async_aqs_filter; older versions overload find_all_async
         find = getattr(DeviceInformation, "find_all_async_aqs_filter", None) or DeviceInformation.find_all_async
         for di in await find(sel):
-            if "iphone" in (di.name or "").lower():
+            try:   # one unreadable paired device must not hide the others
                 d = await BluetoothDevice.from_id_async(di.id)
-                if d is not None:
-                    a = f"{d.bluetooth_address:012X}"
-                    connected = d.connection_status == BluetoothConnectionStatus.CONNECTED
-                    d.close()
-                    mac = ":".join(a[i:i + 2] for i in range(0, 12, 2))
-                    if connected:
-                        return mac
-                    first = first or mac
+            except Exception:  # noqa: BLE001
+                continue
+            if d is None:
+                continue
+            try:
+                name = di.name or getattr(d, "name", "") or ""
+                if not await _is_phone(d, name):
+                    continue
+                found += 1
+                mac = _fmt_mac(d.bluetooth_address)
+                connected = d.connection_status == BluetoothConnectionStatus.CONNECTED
+            finally:
+                d.close()
+            if connected:
+                _known["mac"], _known["name"] = mac, name
+                scan_info["ok"], scan_info["candidates"] = True, found
+                return mac
+            if not first:
+                first, first_name = mac, name
+        scan_info["ok"], scan_info["candidates"] = True, found
     except Exception as e:  # noqa: BLE001
         msg = f"{type(e).__name__}: {e}"[:200]
+        scan_info["ok"], scan_info["candidates"] = False, found
         if _find_err[0] != msg:
             _find_err[0] = msg
             print("find_iphone_mac failed:", msg, flush=True)
+    if first:
+        _known["mac"], _known["name"] = first, first_name
     return first
 
 
@@ -96,6 +143,8 @@ async def iphone(mac: str) -> dict:
     out["paired"] = bool(d.device_information.pairing.is_paired)
     out["connected"] = d.connection_status == BluetoothConnectionStatus.CONNECTED
     d.close()
+    if out["paired"]:
+        _known["mac"], _known["name"] = mac, out["name"] or ""
     return out
 
 
@@ -119,6 +168,10 @@ def endpoints() -> list:
                     with winreg.OpenKey(root, guid + "\\Properties") as pk:
                         dev = str(winreg.QueryValueEx(pk, "{b3f8fa53-0004-438e-9003-51a46e139bfc},6")[0])
                         name = str(winreg.QueryValueEx(pk, "{a45c254e-df1c-4efd-8020-67d146a850e0},2")[0])
+                        try:   # device-interface path of Bluetooth endpoints carries the phone's address (best effort)
+                            iface = str(winreg.QueryValueEx(pk, "{b3f8fa53-0004-438e-9003-51a46e139bfc},2")[0])
+                        except OSError:
+                            iface = ""
                     with winreg.OpenKey(root, guid) as ek:
                         st = int(winreg.QueryValueEx(ek, "DeviceState")[0])
                 except OSError:
@@ -132,17 +185,29 @@ def endpoints() -> list:
                 except Exception:  # noqa: BLE001
                     pass
                 out.append({"flow": flow.lower(), "id": f"{prefix}.{guid}", "name": name, "device": dev, "state": st,
-                            "format": fmt})
+                            "format": fmt, "iface": iface})
     return out
 
 
-def hf_endpoints() -> dict:
-    """iPhone Hands-Free endpoints {"capture": {...}, "render": {...}} (state 1 = hands-free link up)."""
+def hf_endpoints(mac: str = "", name: str = "") -> dict:
+    """The phone's Hands-Free endpoints {"capture": {...}, "render": {...}} (state 1 = hands-free link up). Which endpoints
+    belong to the phone, best match first: its Bluetooth address or name (mac/name, default the phone iphone() or
+    find_iphone_mac() saw last) in the endpoint's device text; "iphone" in it; the generic "AG Audio" (audio gateway = a
+    phone) Hands-Free name. The first tier with any endpoint is used."""
+    mac = (mac or _known["mac"]).replace(":", "").lower()
+    name = (name or _known["name"]).strip().lower()
+    hf = [(e, (e["device"] + " " + (e.get("iface") or "")).lower()) for e in endpoints()]
+    hf = [(e, h) for e, h in hf if "hands-free" in h]
+    tiers = (lambda h: bool(mac and mac in h.replace(":", "")) or bool(len(name) >= 3 and name in h),
+             lambda h: "iphone" in h,
+             lambda h: "ag audio" in h)
     out = {}
-    for e in endpoints():
-        d = e["device"].lower()
-        if "iphone" in d and "hands-free" in d and (e["flow"] not in out or e["state"] < out[e["flow"]]["state"]):
-            out[e["flow"]] = e
+    for tier in tiers:
+        for e, h in hf:
+            if tier(h) and (e["flow"] not in out or e["state"] < out[e["flow"]]["state"]):
+                out[e["flow"]] = e
+        if out:
+            break
     return out
 
 
