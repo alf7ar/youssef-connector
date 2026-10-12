@@ -36,13 +36,13 @@ def test_begin_counts_starts_so_an_import_broken_build_rolls_back(tmp_path):
     seen = []
     for i in range(1, 5):      # entry.py: begin(), then `from connector.main import main` raises: process exits, nothing else runs
         now = 10_000.0 + i * 300
-        seen.append(guard.begin(home, "0.1.2", running=False, can_rollback=True, now=now, spawn=spawned.append))
+        seen.append(guard.begin(home, "0.1.2", running=False, can_rollback=True, now=now, spawn=lambda c, e: spawned.append((c, e))))
         if seen[-1] == "rollback":
             break
         die(home, 1)
     assert seen == ["ok", "ok", "rollback"], seen         # the 3rd start sees two fast deaths in a row
-    assert len(spawned) == 1 and isinstance(spawned[0], str) and "restore.cmd" in spawned[0]
-    assert "robocopy" in (home / "restore.cmd").read_text(encoding="utf-8")
+    assert len(spawned) == 1 and isinstance(spawned[0][0], str) and "restore.cmd" in spawned[0][0]
+    assert spawned[0][1]["YC_BACKUP"] == str(home / "previous")
     assert guard.pinned_bad(home) == "0.1.2"
 
 
@@ -51,7 +51,7 @@ def test_quick_restart_is_counted(tmp_path):
     make_backup(home)
     out = []
     for i in range(3):         # restarted 20 s after each start (inside the old 30 s heartbeat blind spot), each lived 5 s
-        out.append(guard.begin(home, "0.1.2", running=False, can_rollback=True, now=1000.0 + i * 20, spawn=lambda c: None))
+        out.append(guard.begin(home, "0.1.2", running=False, can_rollback=True, now=1000.0 + i * 20, spawn=lambda c, e: None))
         die(home, 5)
     assert out == ["ok", "ok", "rollback"]
 
@@ -116,26 +116,31 @@ def test_heartbeat_refreshes_alive(tmp_path, monkeypatch):
     assert st["alive"] > 1000 and st["clean"] is False
 
 
-def test_restore_script_mirrors_and_checks_robocopy(tmp_path):
-    home = tmp_path / "home"
-    sc = guard.restore_script(home, home / "previous", tmp_path / "app")
-    assert " /MIR " in sc and "/PURGE" not in sc
+def test_restore_script_mirrors_and_checks_robocopy():
+    sc = guard.RESTORE_SCRIPT
+    assert "%YC_MODE%" in sc and "/PURGE" not in sc
     assert sc.index("robocopy") < sc.index("if errorlevel 8 goto fail") < sc.index("move /y") < sc.index('start ""') < sc.index(":fail")
     assert sc.index("exit /b 0") < sc.index(":fail")                 # a failed restore does not start the bad build again
     assert "\r\n" in sc and "\n" not in sc.replace("\r\n", "")
-    inside = guard.restore_script(home, tmp_path / "app" / "previous", tmp_path / "app")
-    assert " /E " in inside and "/MIR" not in inside              # never purge the folder the backup lives in
-    assert "50%%" in guard.restore_script(home, home / "previous", tmp_path / "50%")   # % is doubled in a batch file
+    sc.encode("ascii")                                               # no path (accented / Arabic user names) inside the batch file
+
+
+def test_restore_env_modes_and_unsafe_paths(tmp_path):
+    home, app = tmp_path / "home", tmp_path / "app"
+    e = guard.restore_env(home, home / "previous", app)
+    assert e["YC_MODE"] == "/MIR" and e["YC_BACKUP"] == str(home / "previous") and e["YC_TARGET"] == str(app)
+    assert e["YC_EXE"] == "YoussefConnector.exe" and e["YC_HOME"] == str(home)
+    assert guard.restore_env(home, app / "previous", app)["YC_MODE"] == "/E"       # never purge the folder the backup lives in
     with pytest.raises(ValueError):
-        guard.restore_script(home, tmp_path / 'a"b', tmp_path / "app")
+        guard.restore_env(home, tmp_path / 'a"b', app)
 
 
 def test_restore_command_is_one_string_without_backslash_quotes(tmp_path):
     home = tmp_path / "home dir (x86)"
-    cmd = guard.restore_command(home, home / "previous", tmp_path / "app")
+    cmd = guard.restore_command(home)
     assert isinstance(cmd, str) and '\\"' not in cmd                 # a str reaches Popen verbatim (no list2cmdline)
     assert cmd == f'cmd /d /s /c ""{home / "restore.cmd"}""'
-    assert (home / "restore.cmd").read_bytes().decode("utf-8").startswith("@echo off")
+    assert (home / "restore.cmd").read_bytes().decode("ascii").startswith("@echo off")
 
 
 def test_entry_py_records_the_start_before_main_is_imported(tmp_path):

@@ -129,46 +129,48 @@ def backup_current(home: Path, version: str, src: Path = None, log=print) -> boo
         return False
 
 
-def restore_script(home: Path, backup: Path, target: Path, exe: str = "YoussefConnector.exe") -> str:
-    """Text of <home>/restore.cmd: wait for this process to exit, mirror the backup over the app dir (/MIR: files the bad version
-    added are removed too; /E when the backup lives inside the target, so it is never purged), and only when robocopy succeeded
-    (exit codes 0-7; 8+ is failure) promote the staged rolled_back/guard state and start the old exe. On failure it only logs."""
-    bad = '"' + "\r\n"
-    if any(c in str(p) for p in (home, backup, target, exe) for c in bad):
+RESTORE_SCRIPT = "\r\n".join([
+    "@echo off",
+    "ping -n 4 127.0.0.1 >nul",
+    'robocopy "%YC_BACKUP%" "%YC_TARGET%" %YC_MODE% /NFL /NDL /NJH /NJS /NP >nul',
+    "set RC=%errorlevel%",
+    "if errorlevel 8 goto fail",
+    f'move /y "%YC_HOME%\\{PENDING_ROLLED}" "%YC_HOME%\\rolled_back.json" >nul',
+    f'move /y "%YC_HOME%\\{PENDING_GUARD}" "%YC_HOME%\\guard.json" >nul',
+    'start "" "%YC_TARGET%\\%YC_EXE%"',
+    "exit /b 0",
+    ":fail",
+    'echo %date% %time% update_rollback_failed: robocopy exit %RC%, the app was not restored >> "%YC_HOME%\\connector.log"',
+    "exit /b 1"]) + "\r\n"
+
+
+def restore_env(home: Path, backup: Path, target: Path, exe: str = "YoussefConnector.exe") -> dict:
+    """The paths the helper script uses, as environment variables: the environment is Unicode, a batch file is read in the OEM code
+    page (an accented or Arabic user name would be mangled there), and a value expanded from %VAR% is never re-parsed (no quoting,
+    no % or & problems). /MIR mirrors the backup over the app dir (files the bad version added are removed too); /E when the backup
+    lives inside the target, so it is never purged."""
+    if any(c in str(p) for p in (home, backup, target, exe) for c in '"\r\n'):
         raise ValueError("unsafe path")
-    q = lambda p: '"' + str(p).replace("%", "%%") + '"'          # % would expand inside a batch file
     mode = "/E" if Path(backup).is_relative_to(Path(target)) else "/MIR"
-    lines = ["@echo off", "@chcp 65001 >nul",
-             "ping -n 4 127.0.0.1 >nul",
-             f"robocopy {q(backup)} {q(target)} {mode} /NFL /NDL /NJH /NJS /NP >nul",
-             "set RC=%errorlevel%",
-             "if errorlevel 8 goto fail",
-             f"move /y {q(home / PENDING_ROLLED)} {q(home / 'rolled_back.json')} >nul",
-             f"move /y {q(home / PENDING_GUARD)} {q(home / 'guard.json')} >nul",
-             f"start \"\" {q(Path(target) / exe)}",
-             "exit /b 0",
-             ":fail",
-             f"echo %date% %time% update_rollback_failed: robocopy exit %RC%, the app was not restored >> {q(home / 'connector.log')}",
-             "exit /b 1"]
-    return "\r\n".join(lines) + "\r\n"
+    return {"YC_HOME": str(home), "YC_BACKUP": str(backup), "YC_TARGET": str(target), "YC_EXE": exe, "YC_MODE": mode}
 
 
-def restore_command(home: Path, backup: Path, target: Path, exe: str = "YoussefConnector.exe") -> str:
-    """Write <home>/restore.cmd and return the ONE command-line string that runs it: `cmd /d /s /c ""<path>""`.
-    A str (not a list) goes to Popen verbatim, so Windows list2cmdline never turns quotes into \\" (cmd.exe does not unescape
-    those, robocopy then got paths with literal quote characters). /s strips exactly the outer pair of quotes, so a home path with
-    spaces or parentheses survives (with a bare quoted path cmd would strip the quotes and split at the space). A script file (instead
-    of one long cmd string) keeps the paths out of the command line, can be read by a Linux test and holds the success-only state
-    promotion."""
+def restore_command(home: Path) -> str:
+    """Write <home>/restore.cmd (ASCII, the same text every time) and return the ONE command-line string that runs it:
+    `cmd /d /s /c ""<path>""`. The script waits for this process to exit, mirrors the backup over the app dir and only when robocopy
+    succeeded (exit codes 0-7; 8+ is failure) promotes the staged rolled_back/guard state and starts the old exe; on failure it
+    only logs. A str (not a list) goes to Popen verbatim, so Windows list2cmdline never turns quotes into \\" (cmd.exe does not
+    unescape those: robocopy got paths with literal quote characters). /s strips exactly the outer pair of quotes, so a home path
+    with spaces or parentheses survives (a bare quoted path would lose its quotes and split at the space)."""
     script = Path(home) / "restore.cmd"
     script.parent.mkdir(parents=True, exist_ok=True)
-    script.write_bytes(restore_script(home, backup, target, exe).encode("utf-8"))
+    script.write_bytes(RESTORE_SCRIPT.encode("ascii"))
     return f'cmd /d /s /c ""{script}""'
 
 
-def _spawn(cmd: str):
+def _spawn(cmd: str, env: dict):
     flags = (0x00000008 | 0x00000200) if os.name == "nt" else 0
-    subprocess.Popen(cmd, creationflags=flags, close_fds=True)
+    subprocess.Popen(cmd, creationflags=flags, close_fds=True, env={**os.environ, **env})
 
 
 def rollback_due(home: Path, version: str, now: float = None, boot: float = None) -> bool:
@@ -201,7 +203,7 @@ def rollback(home: Path, version: str, target: Path = None, spawn=_spawn, log=No
         # count (guard.json) nor reports a rollback that did not happen (rolled_back.json)
         _write(home / PENDING_ROLLED, {"from": version, "to": prev, "ts": time.time()})
         _write(home / PENDING_GUARD, {"version": prev, "start": 0, "alive": 0, "clean": True, "fd": 0})
-        spawn(restore_command(home, home / "previous", target))
+        spawn(restore_command(home), restore_env(home, home / "previous", target))
         return True
     except Exception as e:  # noqa: BLE001
         log(f"guard: rollback failed: {type(e).__name__}: {e}")
