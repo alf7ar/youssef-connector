@@ -36,6 +36,7 @@ micguard = _sibling("micguard")
 win_audio = _sibling("win_audio")
 vad = _sibling("vad")
 readiness = _sibling("readiness")
+callhealth = _sibling("callhealth")   # post-call Bluetooth health (bt_recovering) and the hang-up fallback
 
 HOME = micguard.HOME                # %LOCALAPPDATA%\YoussefConnector (YOUSSEF_HOME overrides)
 DEFAULTS_BACKUP = HOME / "default-devices.json"   # normal default devices while the cable route has them switched
@@ -135,7 +136,7 @@ class WinPhone(PhoneAdapter):
     def ready(self) -> dict:
         if self.t_dial is not None and not self.ended:
             return readiness.decorate({"ok": False, "reason": "call_active", "call_active": True})
-        return readiness.check(self.mac, self._log)
+        return callhealth.apply_ready(readiness.check(self.mac, self._log))   # bt_recovering after a call whose audio failed
 
     def dial(self, number: str) -> bool:
         num = re.sub(r"[\s\-().]", "", str(number))
@@ -170,7 +171,7 @@ class WinPhone(PhoneAdapter):
 
     def hangup(self) -> None:
         try:
-            r = phone.end_calls()
+            r = callhealth.hangup(phone, self._log)   # phone.end_calls(), then the Phone Link button if the call stays live
         except Exception as e:  # noqa: BLE001
             r = {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
         self._log("phone_hangup", **r)
@@ -203,6 +204,7 @@ class WinPhone(PhoneAdapter):
     # ---- call flow (calls._flow / watch)
     def _end(self, hint):
         self.ended, self.hint = True, hint
+        callhealth.on_call_end(hint, self.stuck_logged, self.active, self._log)   # audio_error / hf_link_stuck: heal + bt_recovering
         self._restore()
         return "ended"
 
