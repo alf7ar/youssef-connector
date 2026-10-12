@@ -797,14 +797,13 @@ def _stop_after(conn, clock, n):
 
 def test_dns_failure_through_proxy_no_typeerror_normal_backoff(monkeypatch, tmp_path):
     """R-c9: with a proxy set, a gaierror (the proxy's own name) must not take the IP fallback (host= twice -> TypeError
-    killed the run task) and must back off normally; the real websockets.connect goes through the proxy path here."""
+    killed the run task) and must back off normally."""
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
     monkeypatch.setenv("http_proxy", "http://proxy.invalid:3128")
     monkeypatch.delenv("NO_PROXY", raising=False)
     monkeypatch.delenv("no_proxy", raising=False)
     assert cc._proxy_for("ws://hub.test:1/connector/ws") is not None
-    real, calls = cc.connect, []
-    monkeypatch.setattr(cc, "connect", lambda url, **kw: calls.append(dict(kw)) or real(url, **kw))
+    calls = _fake_dns(monkeypatch, resolves=False)     # a connect without host= raises gaierror (the proxy's own name)
 
     async def go():
         clock = RecClock(speed=1000)
@@ -813,7 +812,7 @@ def test_dns_failure_through_proxy_no_typeerror_normal_backoff(monkeypatch, tmp_
         conn._dns_cache["hub.test"] = "127.0.0.1"
         _stop_after(conn, clock, 3)
         await asyncio.wait_for(conn.run(), 30)                       # returns (no TypeError escapes run())
-        assert len(clock.sleeps) == 3 and all("host" not in kw for kw in calls)
+        assert len(clock.sleeps) == 3 and len(calls) == 3 and all("host" not in kw for _, kw in calls)
         lo, hi = cc.DNS_JITTER
         for got, base in zip(clock.sleeps, cc.BACKOFF):
             assert base * lo <= got <= base * hi
