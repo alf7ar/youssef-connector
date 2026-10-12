@@ -172,6 +172,7 @@ class _Call:
         self.source = None
         self.player = None
         self.draining = False
+        self.frames_sent = 0   # 80 ms network frames sent to the hub (audio_stats line)
 
     def finish(self, reason: str) -> bool:
         if self.reason is None:
@@ -470,6 +471,7 @@ class Connector:
                 buf += out_rs.process(frame)
                 while len(buf) >= NET_FRAME_BYTES:
                     await cws.send(buf[:NET_FRAME_BYTES])
+                    call.frames_sent += 1
                     buf = buf[NET_FRAME_BYTES:]
 
         async def receiver():
@@ -508,6 +510,18 @@ class Connector:
             await self.clock.sleep(0.1)
         call.finish("agent_end")
 
+    def _audio_stats(self, call: _Call):
+        """One audio_stats line per call: frames sent plus whatever the audio adapters report. Telemetry only, never raises."""
+        stats = {"frames_sent": call.frames_sent}
+        try:
+            for obj in (call.source, call.player):
+                fn = getattr(obj, "stats", None)
+                if fn is not None:
+                    stats.update(fn() or {})
+        except Exception as e:  # noqa: BLE001
+            stats["error"] = repr(e)[:120]
+        self.log("audio_stats", json.dumps(stats, default=str))
+
     async def _cleanup(self, call: _Call):
         reason = call.reason or "audio_error"
         if reason in ("agent_end", "hangup_cmd", "no_answer", "audio_error"):
@@ -515,6 +529,7 @@ class Connector:
                 await asyncio.to_thread(self.phone.hangup)
             except Exception as e:
                 self.log("hangup failed:", repr(e))
+        self._audio_stats(call)   # before the stops: the adapters' telemetry is read while their owners are still set
         for obj, m in ((call.source, "stop"), (call.player, "stop")):
             if obj is not None:
                 try:

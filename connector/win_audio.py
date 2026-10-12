@@ -117,6 +117,7 @@ class Loudness:
         self.ceiling = ceiling
         self.eq = eq
         self.clear()
+        self.gains, self.peak = [], 0.0   # per-call telemetry: AGC gain of each speech block, output peak (linear)
 
     def clear(self):
         """Fresh filter/limiter state (e.g. after an interruption); the AGC gain is kept."""
@@ -138,6 +139,7 @@ class Loudness:
             want = min(max(self.target / rms, 1.0), self.max_gain)
             want = max(min(want, OUT_PEAK_DRIVE * self.ceiling / max(float(np.max(np.abs(f))), 1e-6)), 1.0)
             self.g += (want - self.g) * (0.5 if want < self.g else 0.15)  # fast down, slower up
+            self.gains.append(self.g)
         y = f * self.g
         t = self.ceiling * OUT_KNEE
         a = np.abs(y)
@@ -145,7 +147,16 @@ class Loudness:
         if over.any():
             y[over] = np.sign(y[over]) * (t + (self.ceiling - t) * np.tanh((a[over] - t) / (self.ceiling - t)))
         y = self.limiter.process(self.lp.process(y))
+        self.peak = max(self.peak, float(np.max(np.abs(y))))
         return np.clip(y * 32767.0, -32768, 32767).astype(np.int16)
+
+    def stats(self) -> dict:
+        """Per-call summary for the audio_stats line: AGC gain over speech (dB, median and max) and the output peak (dBFS)."""
+        out = {"out_peak_dbfs": round(20 * np.log10(self.peak), 1) if self.peak > 0 else None}
+        if self.gains:
+            db = 20 * np.log10(np.asarray(self.gains, dtype=np.float64))
+            out.update(out_gain_p50_db=round(float(np.median(db)), 1), out_gain_max_db=round(float(db.max()), 1))
+        return out
 
     def drain(self) -> np.ndarray:
         """The audio still held in the filter/limiter delay (call at the end of an utterance)."""
@@ -467,6 +478,8 @@ class IdSource:
         self.thread = None
         self.on_event = None   # callback(event, **kw) set by the engine, used for the capture_volume log line
         self.capture_volume = "off"   # config "capture_volume": "off" | "log" (read the Hands-Free mic endpoint volume) | "max" (log, then set 1.0)
+        self.disc0 = getattr(_sc, "discontinuities", 0)   # soundcard's counter is process-wide: this call's count is the delta
+        self.in_ch, self.nsamp, self.t_start, self.t_last = None, 0, None, None   # telemetry: stream channels, samples, timing
 
     def start(self, cb):
         self.thread = threading.Thread(target=self._run, args=(cb,), daemon=True, name="id-source")
@@ -507,7 +520,13 @@ class IdSource:
             with mic.recorder(samplerate=RATE, channels=1, blocksize=RATE // 10) as rec:  # 100 ms WASAPI buffer
                 self.started = True
                 while not self.stopped:
-                    f = rec.record(numframes=CHUNK // 2)[:, 0] * self.gain
+                    raw = rec.record(numframes=CHUNK // 2)
+                    self.in_ch = raw.shape[1]
+                    now = time.monotonic()
+                    self.t_start = self.t_start or now
+                    self.t_last = now
+                    self.nsamp += raw.shape[0]
+                    f = raw[:, 0] * self.gain
                     x = (np.clip(f, -1.0, 1.0) * 32767).astype(np.int16)
                     r = float(np.sqrt(np.mean(x.astype(np.float64) ** 2)))
                     self.levels.append(round(20 * np.log10(r / 32768), 1) if r > 0 else -120.0)
@@ -520,6 +539,12 @@ class IdSource:
 
     def alive(self):
         return not self.stopped and self.error is None and (self.thread is None or self.thread.is_alive())
+
+    def stats(self) -> dict:
+        """Capture telemetry: channels of the stream WASAPI returned, its measured sample rate, soundcard discontinuities this call."""
+        span = (self.t_last - self.t_start) if self.t_start is not None else 0.0
+        return {"in_channels": self.in_ch, "in_rate_est": round(self.nsamp / span) if span > 0 else None,
+                "discontinuities": getattr(_sc, "discontinuities", 0) - self.disc0}
 
     def stop(self):
         self.stopped = True

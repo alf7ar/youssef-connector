@@ -127,6 +127,7 @@ class WinPhone(PhoneAdapter):
         self.hint = None
         self.ended = False
         self.devs = None        # (capture, render): MMDevice IDs (hf_direct) or PortAudio indices (cable)
+        self.cap_format = None  # registry format of the capture endpoint ("16000Hz/16bit/1ch"), for the audio_stats line
         self.switched = False   # cable route: default devices were switched
         self.last_states = None  # last phone_states tuple logged (change-only)
         self.last_states_t = 0.0
@@ -288,6 +289,7 @@ class WinPhone(PhoneAdapter):
                 info = {"in": f"id {hf['capture']['id']} {hf['capture'].get('format')}",
                         "out": f"id {hf['render']['id']} {hf['render'].get('format')}"}
                 self.devs = (hf["capture"]["id"], hf["render"]["id"])
+                self.cap_format = hf["capture"].get("format")
             self._log("audio_devices", route=self.route, **info)
             micguard.mute(_not_room_mics(), self._log)   # the callee hears only Youssef, never the room
             if self.route == "cable":
@@ -333,6 +335,11 @@ class _Source:
         pl = self.owner.player_obj
         return bool(self.inner.alive()) and (pl is None or bool(pl.alive()))
 
+    def stats(self) -> dict:
+        out = dict(self.inner.stats()) if hasattr(self.inner, "stats") else {}
+        out["cap_format"] = getattr(self.owner.phone, "cap_format", None)
+        return out
+
     def stop(self):
         if self.closed:
             return
@@ -367,6 +374,9 @@ class _Player:
 
     def pending(self) -> float:
         return self.inner.pending()
+
+    def stats(self) -> dict:
+        return self.loud.stats() if self.loud is not None else {}
 
     def alive(self) -> bool:
         return bool(self.inner.alive())
