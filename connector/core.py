@@ -225,7 +225,7 @@ class _Call:
 class Connector:
     def __init__(self, base_url: str, token: str, phone: PhoneAdapter, audio: AudioAdapter, gate: AnswerGate,
                  clock: Optional[Clock] = None, host: Optional[str] = None, audio_route: str = "hf_direct",
-                 version: str = CONNECTOR_VERSION, log=None, home=None):
+                 version: str = CONNECTOR_VERSION, log=None, home=None, collect_logs=None):
         self.base = base_url.rstrip("/")
         self.headers = {"X-Connector-Token": token}
         self.phone, self.audio, self.gate = phone, audio, gate
@@ -234,6 +234,7 @@ class Connector:
         self.audio_route = audio_route
         self.version = version
         self.log = log or (lambda *a: None)
+        self.collect_logs = collect_logs      # () -> redacted log text (main.py: logsend.collect); None = the hub's request is ignored
         self.stopped = False
         self.stop_reason: Optional[str] = None     # replaced | outdated | stopped
         self._ws = None
@@ -435,6 +436,20 @@ class Connector:
         elif t == "hangup":
             if self._call and self._call.id == m.get("call_id"):
                 self._call.finish("hangup_cmd")
+        elif t == "send_logs":          # the hub's "send logs" request (the dashboard button): same upload as the status page's
+            if self.collect_logs is not None:
+                self._spawn(self._send_logs_requested())
+
+    async def _send_logs_requested(self):
+        if self.in_call():
+            await self._send({"type": "logs_busy"})
+            return
+        text = await asyncio.to_thread(self.collect_logs)
+        if not await self.send_logs(text):
+            self.log("send_logs requested: not sent (control socket closed)")
+
+    def in_call(self) -> bool:
+        return self._call is not None and self._call.reason is None
 
     def _spawn(self, coro):
         task = asyncio.create_task(coro)

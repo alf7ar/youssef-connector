@@ -480,6 +480,7 @@ class App:
             phone.ready = with_events(phone.ready, lambda: eventwatch.status()["events"])   # keep this LAST: it wraps every other ready() wrapper
             self.conn = core.Connector(ws_base(self.cfg["url"]), self.cfg["token"], phone, audio, gate,
                                        audio_route=route, version=self.version, log=lambda *a: self.log(*a),
+                                       collect_logs=lambda: logsend.collect(self.home, self.cfg),
                                        home=micguard.HOME)   # remote_config.json + dns_cache.json: where win_adapters (ns) reads them
             if hasattr(self.conn, "on_config"):   # server-pushed config (welcome "config"): its "heal" policy
                 self.conn.on_config(lambda c: heal.set_policy((c or {}).get("heal") if isinstance(c, dict) else None))
