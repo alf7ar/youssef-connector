@@ -30,7 +30,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import guard, heal, logsend, power, update
+from . import eventwatch, guard, heal, logsend, power, update
 
 MUTEX = guard.MUTEX
 PORT = 5076
@@ -250,6 +250,21 @@ tick();setInterval(tick,2000);phones();heal();setInterval(phones,10000);setInter
 </script></body></html>"""
 
 
+def with_events(ready_fn, events_fn):
+    """Wrap a ready() callable so crash/driver events from the event-log watcher land in ready["heal"]["events"], merged into
+    whatever "heal" dict the wrapped callable already returns (the heal engine's status), whatever order the wrappers run in."""
+    def ready_with_events():
+        r = ready_fn()
+        try:
+            ev = events_fn()
+        except Exception:  # noqa: BLE001
+            ev = None
+        if ev and isinstance(r, dict):
+            r = {**r, "heal": {**(r.get("heal") if isinstance(r.get("heal"), dict) else {}), "events": ev}}
+        return r
+    return ready_with_events
+
+
 class App:
     def __init__(self, home: Path, version: str, log=print):
         self.home, self.version, self.log = home, version, log
@@ -456,6 +471,8 @@ class App:
             busy = getattr(phone, "busy", None)
             heal.set_in_call(lambda: self.in_call() or bool(busy and busy()))
             heal.set_policy(self.cfg.get("heal"))
+            eventwatch.start(log=lambda *a: self.log(*a))
+            phone.ready = with_events(phone.ready, lambda: eventwatch.status()["events"])   # keep this LAST: it wraps every other ready() wrapper
             self.conn = core.Connector(ws_base(self.cfg["url"]), self.cfg["token"], phone, audio, gate,
                                        audio_route=route, version=self.version, log=lambda *a: self.log(*a))
             if hasattr(self.conn, "on_config"):   # server-pushed config (welcome "config"): its "heal" policy
@@ -466,6 +483,7 @@ class App:
                 await self._send_crash_logs()
                 await self._update_due(check_updates)
             if self.stop_event.is_set():
+                eventwatch.stop()
                 self.conn.stop()
                 task.cancel()
                 with contextlib.suppress(BaseException):
@@ -620,7 +638,7 @@ def selftest(out: Path = None) -> int:
 
     def imports():
         import numpy, onnxruntime, soxr, websockets  # noqa: F401,E401
-        mods = ["core", "fakes", "vad", "update", "readiness", "heal", "micguard", "comstress", "supervisor"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
+        mods = ["core", "fakes", "vad", "update", "readiness", "heal", "micguard", "comstress", "supervisor", "eventwatch"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
         for m in mods:
             importlib.import_module(f"{__package__ or 'connector'}.{m}")
         return f"version {read_version()}, {len(mods)} connector modules"
