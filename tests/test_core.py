@@ -495,3 +495,265 @@ def test_blackholed_network_mid_call_hangs_up_within_ping_timeout(monkeypatch):
             await asyncio.sleep(0.3)
             assert r.audio.sources and all(s._stop.is_set() for s in r.audio.sources)
     run(go())
+
+
+# ---- server-pushed config (welcome["config"]) ----------------------------------------------------------------------
+CFG = {"heal": {"radio_cycle": False, "adapter_reset": False, "max_adapter_resets_per_hour": 2,
+                "max_radio_toggles_per_hour": 4}, "ns": "off", "in_gain": 1.5}
+
+
+async def _started(hub):
+    await hub.start()
+    return hub
+
+
+def _conn(hub, clock, **kw):
+    return cc.Connector(hub.url, "tok", FakePhone(clock=clock), FakeAudio(clock=clock), FakeGate(True), clock=clock,
+                        host="testhost", **kw)
+
+
+async def _until_true(pred, timeout=10.0):
+    t0 = asyncio.get_running_loop().time()
+    while not pred():
+        assert asyncio.get_running_loop().time() - t0 < timeout
+        await asyncio.sleep(0.02)
+
+
+@contextlib.asynccontextmanager
+async def _running(conn, hub):
+    task = asyncio.create_task(conn.run())
+    try:
+        yield
+    finally:
+        conn.stop()
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
+        await hub.stop()
+
+
+def test_welcome_config_kept_persisted_and_callbacks(tmp_path):
+    async def go():
+        import json
+        hub = await _started(MockHub(config=CFG))
+        conn = _conn(hub, RecClock(), home=tmp_path)
+        got = []
+        conn.on_config(got.append)
+        async with _running(conn, hub):
+            await _until_true(lambda: got)
+        assert got[0] == CFG and conn.remote_config == CFG
+        assert json.loads((tmp_path / "remote_config.json").read_text()) == CFG
+        got[0]["ns"] = "x"                                   # callbacks get a copy
+        assert conn.remote_config["ns"] == "off"
+    run(go())
+
+
+def test_config_loaded_at_start_replayed_and_server_wins(tmp_path):
+    async def go():
+        import json
+        (tmp_path / "remote_config.json").write_text(json.dumps({"ns": "rnnoise"}))
+        hub = await _started(MockHub(config=CFG))
+        conn = _conn(hub, RecClock(), home=tmp_path)
+        assert conn.remote_config == {"ns": "rnnoise"}      # available before any welcome
+        got = []
+        conn.on_config(got.append)
+        assert got == [{"ns": "rnnoise"}]                    # replayed on registration
+        async with _running(conn, hub):
+            await _until_true(lambda: len(got) == 2)
+        assert got[1] == CFG and json.loads((tmp_path / "remote_config.json").read_text()) == CFG
+    run(go())
+
+
+def test_welcome_without_config_changes_nothing(tmp_path):
+    async def go():
+        hub = await _started(MockHub())
+        conn = _conn(hub, RecClock(), home=tmp_path)
+        got = []
+        conn.on_config(got.append)
+        async with _running(conn, hub):
+            await hub.wait_msg("hello")
+            await _until_true(lambda: conn._welcomed)
+        assert got == [] and conn.remote_config == {} and not (tmp_path / "remote_config.json").exists()
+    run(go())
+
+
+def test_bad_config_and_bad_callback_are_harmless(tmp_path):
+    async def go():
+        hub = await _started(MockHub(config=["not", "a", "dict"]))
+        conn = _conn(hub, RecClock(), home=tmp_path)
+        async with _running(conn, hub):
+            await _until_true(lambda: conn._welcomed)
+        assert conn.remote_config == {}
+        hub2 = await _started(MockHub(config=CFG))
+        conn2 = _conn(hub2, RecClock())                      # no home: nothing persisted
+        ok = []
+        conn2.on_config(lambda c: 1 / 0)
+        conn2.on_config(ok.append)
+        async with _running(conn2, hub2):
+            await _until_true(lambda: ok)
+    run(go())
+
+
+def test_corrupt_remote_config_file_ignored(tmp_path):
+    (tmp_path / "remote_config.json").write_text("{nope")
+    assert cc.Connector("ws://127.0.0.1:1", "tok", FakePhone(), FakeAudio(), FakeGate(), home=tmp_path).remote_config == {}
+
+
+# ---- DNS resilience --------------------------------------------------------------------------------------------------
+def _fake_dns(monkeypatch, resolves: bool):
+    """Replace core.connect: a call without host= fails like an unresolvable name (or, resolves=True, is pinned to 127.0.0.1)."""
+    import socket
+    calls = []
+    real = cc.connect
+
+    def fake(url, **kw):
+        calls.append((url, dict(kw)))
+        if "host" not in kw:
+            if not resolves:
+                raise socket.gaierror(-2, "Name or service not known")
+            kw["host"] = "127.0.0.1"
+        return real(url, **kw)
+    monkeypatch.setattr(cc, "connect", fake)
+    return calls
+
+
+def test_dns_failure_uses_last_good_ip_keeps_hostname(monkeypatch, tmp_path):
+    async def go():
+        reports = []
+        monkeypatch.setattr(cc, "_heal_report", lambda failure, **d: reports.append((failure, d)))
+        calls = _fake_dns(monkeypatch, resolves=False)
+        hub = MockHub()
+        await hub.start()
+        clock = RecClock()
+        conn = cc.Connector(f"ws://hub.test:{hub.port}", "tok", FakePhone(clock=clock), FakeAudio(clock=clock), FakeGate(True),
+                            clock=clock, host="testhost", home=tmp_path)
+        conn._dns_cache["hub.test"] = "127.0.0.1"
+        task = asyncio.create_task(conn.run())
+        try:
+            await _until_true(lambda: conn._welcomed)
+            assert calls[0][1].get("host") is None and calls[1][1]["host"] == "127.0.0.1"
+            assert calls[1][0].startswith("ws://hub.test:")          # URL (SNI / Host / cert name) keeps the hostname
+            assert hub.hosts_seen[0] == f"hub.test:{hub.port}"
+            assert reports and reports[0][0] == "net_dns" and reports[0][1]["cached_ip"] is True
+        finally:
+            conn.stop()
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+            await hub.stop()
+    run(go())
+
+
+def test_dns_ip_remembered_after_good_connect_and_persisted(monkeypatch, tmp_path):
+    async def go():
+        import json
+        _fake_dns(monkeypatch, resolves=True)
+        hub = MockHub()
+        await hub.start()
+        clock = RecClock()
+        conn = cc.Connector(f"ws://hub.test:{hub.port}", "tok", FakePhone(clock=clock), FakeAudio(clock=clock), FakeGate(True),
+                            clock=clock, host="testhost", home=tmp_path)
+        task = asyncio.create_task(conn.run())
+        try:
+            await _until_true(lambda: conn._welcomed)
+            assert conn._dns_cache == {"hub.test": "127.0.0.1"}
+            assert json.loads((tmp_path / "dns_cache.json").read_text()) == {"hub.test": "127.0.0.1"}
+        finally:
+            conn.stop()
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+            await hub.stop()
+        again = cc.Connector("ws://hub.test:1", "tok", FakePhone(clock=clock), FakeAudio(clock=clock), FakeGate(), home=tmp_path)
+        assert again._dns_cache == {"hub.test": "127.0.0.1"}        # survives a restart
+    run(go())
+
+
+def test_ip_literal_url_is_not_cached(monkeypatch):
+    async def go():
+        hub = MockHub()
+        async with rig("answer", hub=hub) as r:
+            await hub.wait_msg("hello")
+            assert r.conn._dns_cache == {}
+    run(go())
+
+
+def test_dns_failure_without_cache_backs_off_with_jitter(monkeypatch):
+    async def go():
+        reports = []
+        monkeypatch.setattr(cc, "_heal_report", lambda failure, **d: reports.append((failure, d)))
+        _fake_dns(monkeypatch, resolves=False)
+        clock = RecClock(speed=1000)
+        conn = cc.Connector("ws://hub.test:1", "tok", FakePhone(clock=clock), FakeAudio(clock=clock), FakeGate(), clock=clock)
+        orig = clock.sleep
+
+        async def sleep(s):
+            await orig(s)
+            if len(clock.sleeps) >= 6:
+                conn.stop()
+        clock.sleep = sleep
+        await conn.run()
+        lo, hi = cc.DNS_JITTER
+        for got, base in zip(clock.sleeps, cc.BACKOFF):
+            assert base * lo <= got <= base * hi
+        assert clock.sleeps[4] != clock.sleeps[5]                    # both are capped at 30 s, jitter keeps them apart
+        assert len(reports) >= 6 and all(f == "net_dns" and d["cached_ip"] is False for f, d in reports)
+    run(go())
+
+
+def test_non_dns_oserror_does_not_use_cache_and_keeps_plain_backoff():
+    async def go():
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        clock = RecClock(speed=1000)
+        conn = cc.Connector(f"ws://127.0.0.1:{port}", "tok", FakePhone(clock=clock), FakeAudio(clock=clock), FakeGate(), clock=clock)
+        conn._dns_cache["127.0.0.1"] = "not-an-ip"
+        orig = clock.sleep
+
+        async def sleep(s):
+            await orig(s)
+            if len(clock.sleeps) >= 3:
+                conn.stop()
+        clock.sleep = sleep
+        await conn.run()
+        assert clock.sleeps[:3] == [1, 2, 4]
+    run(go())
+
+
+def test_heal_report_is_safe_without_heal_module():
+    cc._heal_report("net_dns", host="x")
+
+
+def test_dns_fallback_for_call_socket(monkeypatch):
+    async def go():
+        calls = _fake_dns(monkeypatch, resolves=True)        # control socket resolves (IP gets cached)...
+        hub = MockHub()
+        await hub.start()
+        clock = RecClock()
+        conn = cc.Connector(f"ws://hub.test:{hub.port}", "tok", FakePhone("answer", clock=clock), FakeAudio(clock=clock),
+                            FakeGate(True), clock=clock, host="testhost")
+        task = asyncio.create_task(conn.run())
+        try:
+            await _until_true(lambda: conn._welcomed)
+            import socket
+
+            def dead(url, **kw):                              # ...then DNS dies before the call socket opens
+                calls.append((url, dict(kw)))
+                if "host" not in kw:
+                    raise socket.gaierror(-3, "Temporary failure in name resolution")
+                return orig(url, **kw)
+            orig = cc.connect
+            monkeypatch.setattr(cc, "connect", dead)
+            await hub.dial("01012345678", "c1")
+            await hub.wait_call("c1")
+            assert any("/call/c1/ws" in u and kw.get("host") == "127.0.0.1" for u, kw in calls)
+        finally:
+            conn.stop()
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+            await hub.stop()
+    run(go())
