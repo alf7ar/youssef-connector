@@ -162,6 +162,7 @@ def mask_mac(mac: str) -> str:
 def _list_phones() -> tuple:
     """(phones, error): paired iPhone candidates from phone.paired_iphones(); error text only when the scan failed."""
     try:
+        import onnxruntime  # noqa: F401  # before winrt (phone), never after: DLL clash (PORT_NOTES.md)
         from . import phone
         return asyncio.run(asyncio.wait_for(phone.paired_iphones(), 10)), ""
     except Exception as e:  # noqa: BLE001
