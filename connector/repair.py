@@ -1,8 +1,8 @@
 """User-side trigger for the elevated repair task (installer registers the SYSTEM scheduled task "YoussefRepair").
 
-The task script restarts the Bluetooth adapter + services and writes %ProgramData%\\YoussefConnector\\repair\\last.json
-(time, steps, rc). This module only starts the task (schtasks /run, no elevation needed: the task grants Users run
-rights) and waits for a NEW last.json. Registered with connector.heal as the heavy action "adapter_reset".
+The task script restarts the Bluetooth adapter + services and writes %ProgramFiles%\\YoussefConnector\\repair\\last.json
+(time, steps, rc; the folder is admin-only writable, Users may read). This module only starts the task (schtasks /run,
+no elevation needed: the task grants Users run rights) and waits for a NEW last.json. Registered with connector.heal as the heavy action "adapter_reset".
 """
 from __future__ import annotations
 
@@ -20,7 +20,8 @@ SCHTASKS_TIMEOUT = 20
 
 
 def last_json_path() -> Path:
-    base = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
+    # 64-bit Program Files (the installer runs in 64-bit mode); ProgramW6432 also covers a 32-bit interpreter
+    base = os.environ.get("ProgramW6432") or os.environ.get("ProgramFiles") or r"C:\Program Files"
     return Path(base) / "YoussefConnector" / "repair" / "last.json"
 
 
