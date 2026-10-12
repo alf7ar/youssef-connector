@@ -41,6 +41,7 @@ phonelink = _sibling("phonelink")   # Phone Link launch + dial failure classific
 HOME = micguard.HOME                # %LOCALAPPDATA%\YoussefConnector (YOUSSEF_HOME overrides)
 DEFAULTS_BACKUP = HOME / "default-devices.json"   # normal default devices while the cable route has them switched
 GONE_S = 1.2        # s without any live call (before the call audio is on the laptop) that mean the call is over (3 x 0.4 s)
+LINE_POLL_S = 0.25   # s between two phone-line checks while a dial retry waits
 OFF_S = 1.5         # s of "call ended" / "Hands-Free link dropped" that mean the call is over (3 x 0.5 s)
 NO_AUDIO_S = 30.0   # s the Phone Service says "talking" without the Hands-Free link coming up: give up (audio_error)
 
@@ -149,14 +150,12 @@ class WinPhone(PhoneAdapter):
             self.last_error = "a call is already up on the laptop: end it first"
             self._log("dial_refused", why=self.last_error)
             return False
+        t0 = time.monotonic()
         r = asyncio.run(phone.phone_link("dial", num))   # plcall.ps1 returns once Windows sees the call
         self._log("dial", number_tail=num[-4:], ok=r.get("ok"), error=r.get("error"), method=r.get("method"))
         reason = None if r.get("ok") else phonelink.reason_for(r.get("error"))
-        if reason and not phone.call_flags().get("call_active"):   # Phone Link UI failure: one retry, no call is up
-            time.sleep(phonelink.RETRY_S)
-            r = asyncio.run(phone.phone_link("dial", num))
-            self._log("dial_retry", number_tail=num[-4:], ok=r.get("ok"), error=r.get("error"), first=reason)
-            reason = None if r.get("ok") else phonelink.reason_for(r.get("error"))
+        if reason and phonelink.retryable(r.get("error")):   # failed before the Call button was pressed
+            r, reason = self._retry_dial(num, t0, r, reason)
         if not r.get("ok"):
             self.last_error = str(r.get("error") or "Phone Link dial failed")
             if reason:
@@ -168,6 +167,60 @@ class WinPhone(PhoneAdapter):
             self.t_dial = time.monotonic()
         self.last_error = ""
         return True
+
+    def _line(self) -> str:
+        """Windows' view of the phone line: "call" (a call is up or the Hands-Free link is active), "incoming", "unknown"
+        (call state not readable) or "clear" (call_active False, no incoming call, no Hands-Free link)."""
+        try:
+            flags = phone.call_flags()
+            active, incoming = flags.get("call_active"), flags.get("call_incoming")
+            if active is True or phone.hf_link() == "active":
+                return "call"
+            if incoming:
+                return "incoming"
+            return "clear" if active is False and incoming is not None else "unknown"
+        except Exception:  # noqa: BLE001
+            return "unknown"
+
+    def _watch_line(self, secs: float) -> str:
+        """Watch the line for secs: "call" as soon as one is up, "incoming" if one rings, else the final _line() state."""
+        seen_incoming = False
+        for _ in range(int(secs / LINE_POLL_S)):
+            st = self._line()
+            if st == "call":
+                return st
+            seen_incoming = seen_incoming or st == "incoming"
+            time.sleep(LINE_POLL_S)
+        st = self._line()
+        return "incoming" if seen_incoming and st != "call" else st
+
+    def _retry_dial(self, num, t0, r, reason):
+        """One retry of a dial that failed BEFORE the Call button was pressed. Never when it could ring the callee twice:
+        only within RETRY_MAX_ELAPSED_S of the request, only when the line is clear after the wait, and a call that appears
+        during the wait counts as the dial having worked. Returns (result, reason); the first failure when not retried."""
+        def skip(why):
+            self._log("dial_no_retry", why=why, first=reason, secs=round(time.monotonic() - t0, 1))
+            return r, reason
+        if time.monotonic() - t0 >= phonelink.RETRY_MAX_ELAPSED_S:
+            return skip("slow_failure")
+        if self._line() != "clear":
+            return skip("line_not_clear")
+        if reason == phonelink.REASON_NOT_RUNNING:
+            lr = phonelink.launch()
+            self._log("phone_link_launch", ok=lr.get("ok"), launched=lr.get("launched"), error=lr.get("error"))
+            if not lr.get("ok"):
+                return skip("launch_failed")
+        st = self._watch_line(phonelink.RETRY_S)
+        if st == "call":
+            self._log("dial_late_success", first=reason, secs=round(time.monotonic() - t0, 1))
+            return {"ok": True, "method": "late"}, None
+        if st != "clear":
+            return skip(st)
+        if time.monotonic() - t0 >= phonelink.RETRY_START_DEADLINE_S:
+            return skip("too_late")
+        r2 = asyncio.run(phone.phone_link("dial", num))
+        self._log("dial_retry", number_tail=num[-4:], ok=r2.get("ok"), error=r2.get("error"), first=reason)
+        return r2, (None if r2.get("ok") else phonelink.reason_for(r2.get("error")))
 
     def call_state(self) -> str:
         with self.lock:

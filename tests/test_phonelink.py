@@ -83,10 +83,14 @@ def test_launch_times_out_after_20_seconds(monkeypatch, clock):
     assert 20.0 <= clock.t <= 21.0
 
 
-def test_launch_treats_unknown_process_state_as_not_running(monkeypatch, clock):
+def test_launch_unknown_process_state_is_not_not_running(monkeypatch, clock):
+    """tasklist failing (None) must not pop Phone Link up: no launch, ok False."""
+    popen = []
     monkeypatch.setattr(readiness, "_tasklist_has", lambda image: None)
-    monkeypatch.setattr(phonelink.subprocess, "Popen", lambda *a, **k: None)
-    assert phonelink.launch()["ok"] is False
+    monkeypatch.setattr(phonelink.subprocess, "Popen", lambda *a, **k: popen.append(a))
+    r = phonelink.launch()
+    assert r["ok"] is False and r["launched"] is False and r["running"] is None
+    assert popen == [] and clock.t == 0.0
 
 
 def test_launch_is_registered_with_heal_as_safe_tier(monkeypatch):
@@ -119,6 +123,19 @@ def test_reason_for_plcall_errors(err, reason):
     assert phonelink.reason_for(err) == reason
 
 
+@pytest.mark.parametrize("err, ok", [
+    ("Phone Link is not running", True),
+    ("Phone Link dialer did not show the number", True),
+    ("no Calls UI", True),
+    ("Phone Link did not start the call", False),   # after the Call press: the phone may already ring
+    ("plcall timeout", False),
+    ("bad number", False),
+    (None, False),
+])
+def test_retryable_only_before_the_call_button_press(err, ok):
+    assert phonelink.retryable(err) is ok
+
+
 def test_report_goes_to_heal_when_present(heal):
     phonelink.report("phone_link_not_linked", error="x")
     assert heal.reports == [("phone_link_not_linked", {"error": "x"})]
@@ -136,91 +153,225 @@ def test_reason_codes_have_texts():
 
 
 # ---------------------------------------------------------------- WinPhone.dial retry
-class FakePhone:
-    """Stands in for connector.phone: scripted plcall results, idle line."""
+NOT_SHOWN = {"ok": False, "error": "Phone Link dialer did not show the number"}
+NOT_RUNNING = {"ok": False, "error": "Phone Link is not running"}
+NOT_STARTED = {"ok": False, "error": "Phone Link did not start the call"}
+OK = {"ok": True, "method": "invoke", "button": "Call"}
 
-    def __init__(self, results, call_active=False, active_after_first=False):
-        self.results = list(results)
+
+class World:
+    """Fake clock + scripted phone line shared by the fake phone module and win_adapters' time."""
+
+    def __init__(self):
+        self.t = 0.0
+        self.sleeps = []
+        self.events = []        # (time, fn): run when the clock passes the time
+        self.call_active = False
+        self.call_incoming = False
+        self.hf = "absent"
+        self.launches = []
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, s):
+        self.sleeps.append(s)
+        self.advance(s)
+
+    def advance(self, s):
+        self.t += s
+        for ev in [e for e in self.events if e[0] <= self.t]:
+            self.events.remove(ev)
+            ev[1]()
+
+    def at(self, t, fn):
+        self.events.append((t, fn))
+
+
+class FakePhone:
+    """Stands in for connector.phone: scripted plcall results (each takes durations[i] s), a scripted line."""
+
+    def __init__(self, world, results, durations):
+        self.world, self.results, self.durations = world, list(results), list(durations)
         self.calls = []
-        self.call_active = call_active
-        self.active_after_first = active_after_first
 
     async def phone_link(self, action, number=""):
         self.calls.append((action, number))
-        if self.active_after_first:   # Windows sees a call after the first attempt
-            self.call_active = True
+        self.world.advance(self.durations.pop(0) if self.durations else 0.5)
         return self.results.pop(0)
 
     def hf_link(self):
-        return "absent"
+        return self.world.hf
 
     def call_flags(self):
-        return {"call_active": self.call_active, "call_incoming": False}
+        return {"call_active": self.world.call_active, "call_incoming": self.world.call_incoming}
 
 
 @pytest.fixture
 def dialer(monkeypatch):
-    sleeps = []
-    monkeypatch.setattr(win_adapters, "time", types.SimpleNamespace(monotonic=time.monotonic,
-                                                                   sleep=lambda s: sleeps.append(s)))
+    world = World()
+    monkeypatch.setattr(win_adapters, "time", types.SimpleNamespace(monotonic=world.monotonic, sleep=world.sleep))
+    monkeypatch.setattr(phonelink, "launch", lambda: (world.launches.append(world.t), {"ok": True, "launched": True})[1])
 
-    def make(results, call_active=False, active_after_first=False):
-        fake = FakePhone(results, call_active, active_after_first)
+    def make(results, durations=()):
+        fake = FakePhone(world, results, durations)
         monkeypatch.setattr(win_adapters, "phone", fake)
         logs = []
         w = win_adapters.WinPhone("hf_direct", "", lambda ev, s="": logs.append((ev, s)))
         return w, fake, logs
-    return make, sleeps
+    return make, world
 
 
-def test_dial_retries_once_after_3s_on_phone_link_ui_failure(dialer, heal):
-    make, sleeps = dialer
-    w, fake, logs = make([{"ok": False, "error": "Phone Link dialer did not show the number"},
-                          {"ok": True, "method": "invoke", "button": "Call"}])
+def test_dial_retries_once_after_3s_on_pre_press_failure(dialer, heal):
+    make, world = dialer
+    w, fake, logs = make([NOT_SHOWN, OK])
     assert w.dial("01012345678") is True
     assert len(fake.calls) == 2 and fake.calls[0] == fake.calls[1] == ("dial", "01012345678")
-    assert sleeps == [3.0]
+    assert sum(world.sleeps) == pytest.approx(phonelink.RETRY_S)
+    assert world.launches == []         # the launch is only for "not running"
     assert any(ev == "dial_retry" for ev, _ in logs)
-    assert heal.reports == []           # the retry succeeded: nothing to report
+    assert heal.reports == []
     assert w.t_dial is not None
 
 
 def test_dial_failing_twice_reports_not_linked(dialer, heal):
-    make, sleeps = dialer
-    err = {"ok": False, "error": "Phone Link dialer did not show the number"}
-    w, fake, _ = make([dict(err), dict(err)])
+    make, world = dialer
+    w, fake, _ = make([dict(NOT_SHOWN), dict(NOT_SHOWN)])
     assert w.dial("01012345678") is False
-    assert len(fake.calls) == 2 and sleeps == [3.0]
+    assert len(fake.calls) == 2
     assert w.last_error.startswith("phone_link_not_linked: ")
     assert heal.reports and heal.reports[0][0] == "phone_link_not_linked"
     assert w.t_dial is None
 
 
-def test_dial_not_running_is_reported_as_phone_link_not_running(dialer, heal):
-    make, _ = dialer
-    w, fake, _ = make([{"ok": False, "error": "Phone Link is not running"},
-                       {"ok": False, "error": "Phone Link is not running"}])
+def test_dial_not_running_launches_phone_link_before_the_retry(dialer, heal):
+    make, world = dialer
+    w, fake, _ = make([NOT_RUNNING, OK], [0.5, 0.5])
+    assert w.dial("01012345678") is True
+    assert len(fake.calls) == 2 and world.launches == [0.5]
+
+
+def test_dial_not_running_twice_is_reported_as_phone_link_not_running(dialer, heal):
+    make, world = dialer
+    w, fake, _ = make([dict(NOT_RUNNING), dict(NOT_RUNNING)])
     assert w.dial("01012345678") is False
     assert heal.reports[0][0] == "phone_link_not_running"
 
 
+def test_dial_not_running_without_a_launch_does_not_retry(dialer, heal, monkeypatch):
+    make, world = dialer
+    monkeypatch.setattr(phonelink, "launch", lambda: {"ok": False, "launched": False, "error": "state unknown"})
+    w, fake, logs = make([NOT_RUNNING, OK])
+    assert w.dial("01012345678") is False
+    assert len(fake.calls) == 1 and world.sleeps == []
+    assert ("dial_no_retry" in [ev for ev, _ in logs]) and '"launch_failed"' in dict(logs)["dial_no_retry"]
+    assert heal.reports[0][0] == "phone_link_not_running"
+
+
+def test_dial_does_not_retry_after_the_call_button_was_pressed(dialer, heal):
+    """press-then-fail: 'did not start the call' means the Call button was pressed and the phone may be ringing."""
+    make, world = dialer
+    w, fake, _ = make([NOT_STARTED, OK], [2.0])
+    assert w.dial("01012345678") is False
+    assert len(fake.calls) == 1 and world.sleeps == []
+    assert heal.reports[0][0] == "phone_link_not_linked"
+
+
+def test_dial_does_not_retry_a_slow_failure(dialer, heal):
+    """a failure 5+ s after the request is past the point where the hub would still take a ring (ack_timeout 15 s)."""
+    make, world = dialer
+    w, fake, logs = make([NOT_SHOWN, OK], [12.0])
+    assert w.dial("01012345678") is False
+    assert len(fake.calls) == 1 and world.sleeps == [] and world.launches == []
+    assert '"slow_failure"' in dict(logs)["dial_no_retry"]
+
+
+def test_dial_just_under_5s_still_retries(dialer, heal):
+    make, world = dialer
+    w, fake, _ = make([NOT_SHOWN, OK], [4.9])
+    assert w.dial("01012345678") is True and len(fake.calls) == 2
+
+
+def test_dial_retry_must_start_before_the_deadline(dialer, heal, monkeypatch):
+    """a slow Phone Link launch pushes the retry past the deadline: no retry."""
+    make, world = dialer
+    monkeypatch.setattr(phonelink, "launch", lambda: (world.advance(8.0), {"ok": True, "launched": True})[1])
+    w, fake, logs = make([NOT_RUNNING, OK], [0.5])
+    assert w.dial("01012345678") is False
+    assert len(fake.calls) == 1 and '"too_late"' in dict(logs)["dial_no_retry"]
+
+
+def test_dial_call_appearing_during_the_wait_is_success_not_a_second_dial(dialer, heal):
+    make, world = dialer
+    w, fake, logs = make([NOT_SHOWN, OK], [0.5])
+    world.at(1.5, lambda: setattr(world, "call_active", True))
+    assert w.dial("01012345678") is True
+    assert len(fake.calls) == 1          # no second plcall
+    assert w.t_dial is not None
+    assert any(ev == "dial_late_success" for ev, _ in logs)
+    assert heal.reports == []
+
+
+def test_dial_hf_link_coming_up_during_the_wait_is_success(dialer, heal):
+    make, world = dialer
+    w, fake, _ = make([NOT_SHOWN, OK], [0.5])
+    world.at(2.0, lambda: setattr(world, "hf", "active"))
+    assert w.dial("01012345678") is True and len(fake.calls) == 1
+
+
+def test_dial_unknown_call_state_never_retries(dialer, heal):
+    make, world = dialer
+    world.call_active = None
+    w, fake, logs = make([NOT_SHOWN, OK])
+    assert w.dial("01012345678") is False
+    assert len(fake.calls) == 1 and world.sleeps == []
+    assert '"line_not_clear"' in dict(logs)["dial_no_retry"]
+
+
+def test_dial_call_state_turning_unknown_during_the_wait_never_retries(dialer, heal):
+    make, world = dialer
+    w, fake, logs = make([NOT_SHOWN, OK], [0.5])
+    world.at(2.0, lambda: setattr(world, "call_active", None))
+    assert w.dial("01012345678") is False
+    assert len(fake.calls) == 1
+    assert '"unknown"' in dict(logs)["dial_no_retry"]
+
+
+def test_dial_incoming_call_during_the_wait_never_retries(dialer, heal):
+    make, world = dialer
+    w, fake, logs = make([NOT_SHOWN, OK], [0.5])
+    world.at(1.0, lambda: setattr(world, "call_incoming", True))
+    world.at(2.0, lambda: setattr(world, "call_incoming", False))   # it stopped again before the wait ended
+    assert w.dial("01012345678") is False
+    assert len(fake.calls) == 1 and '"incoming"' in dict(logs)["dial_no_retry"]
+
+
+def test_dial_hf_link_already_active_never_retries(dialer, heal):
+    make, world = dialer
+    w, fake, _ = make([NOT_SHOWN, OK], [0.5])
+    world.at(0.2, lambda: setattr(world, "hf", "active"))   # up by the time the first attempt returns
+    assert w.dial("01012345678") is False
+    assert len(fake.calls) == 1 and world.sleeps == []
+
+
 def test_dial_does_not_retry_on_bad_number(dialer, heal):
-    make, sleeps = dialer
+    make, world = dialer
     w, fake, _ = make([{"ok": False, "error": "bad number"}])
     assert w.dial("01012345678") is False
-    assert len(fake.calls) == 1 and sleeps == []
+    assert len(fake.calls) == 1 and world.sleeps == []
     assert heal.reports == []
 
 
 def test_dial_does_not_retry_on_timeout(dialer, heal):
-    make, sleeps = dialer
+    make, world = dialer
     w, fake, _ = make([{"ok": False, "error": "plcall timeout"}])
     assert w.dial("01012345678") is False
-    assert len(fake.calls) == 1 and sleeps == []
+    assert len(fake.calls) == 1 and world.sleeps == []
 
 
 def test_dial_does_not_retry_when_a_call_is_already_up(dialer, heal):
-    make, sleeps = dialer
-    w, fake, _ = make([{"ok": False, "error": "Phone Link dialer did not show the number"}], active_after_first=True)
+    make, world = dialer
+    w, fake, _ = make([NOT_SHOWN], [0.5])
+    world.at(0.2, lambda: setattr(world, "call_active", True))
     assert w.dial("01012345678") is False
-    assert len(fake.calls) == 1 and sleeps == []
+    assert len(fake.calls) == 1 and world.sleeps == []
