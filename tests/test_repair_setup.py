@@ -162,6 +162,11 @@ def test_install_script_static():
     assert "$env:PATH = [Environment]::SystemDirectory" in code
     # never adopt: a folder that is not ours is renamed aside; new folders/files get their DACL at creation
     assert "if ((Test-There $Base) -and -not (Test-Ours $Base)) { Move-Aside $Base }" in code
+    # predicate functions must emit nothing on the pipeline besides their bool (CI found a truthy ('log', $false) array)
+    for fn in ("Test-Ours", "Test-Reparse", "Test-There"):
+        body = code[code.index("function " + fn):]
+        body = body[:body.index("\n}\n")]
+        assert all("| Out-Host" in ln for ln in body.splitlines() if re.search(r"\bSay\b|Write-Output", ln)), fn
     assert "[IO.Directory]::CreateDirectory($p, (New-Acl $true))" in code
     assert "[IO.FileMode]::CreateNew" in code and "(New-Acl $false))" in code
     # task: deleted first, then TASK_CREATE with the SDDL in the same call; action verified exactly

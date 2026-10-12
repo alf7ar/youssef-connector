@@ -76,7 +76,8 @@ function New-SecureDir([string]$p) {
 }
 
 function Test-Ours([string]$p) {
-    try { Assert-SecureAcl $p; return $true } catch { Say "not ours: $($_.Exception.Message)"; return $false }
+    # the log line goes to the host, not the pipeline: pipeline output would become part of the (then truthy) return value
+    try { Assert-SecureAcl $p; return $true } catch { Say "not ours: $($_.Exception.Message)" | Out-Host; return $false }
 }
 
 function Move-Aside([string]$p) {
