@@ -20,7 +20,7 @@ CASES = [
     ("schtasks_query", ["schtasks", "/query", "/tn", "YoussefRepair"], {0, 1}, False),
     ("pnputil_bluetooth", ["pnputil", "/enum-devices", "/class", "Bluetooth"], {0, 1, 259}, False),
     ("netsh_winhttp_proxy", ["netsh", "winhttp", "show", "proxy"], {0}, False),
-    ("ps_get_pnpdevice", ["powershell", "-NoProfile", "-NonInteractive", "-Command", PS_PNP], {0, 1}, False)  # rc 1 with no output seen on the runner (no BT class),
+    ("ps_get_pnpdevice", ["powershell", "-NoProfile", "-NonInteractive", "-Command", PS_PNP], {0, 1}, False),  # rc 1 with no output seen on the runner (no BT class)
     # informational only: the Phone Link app is normally absent on the runner. The explorer.exe launch is NOT run.
     ("ps_yourphone_apps", ["powershell", "-NoProfile", "-NonInteractive", "-Command", PS_APPS], {0, 1}, True),
 ]
