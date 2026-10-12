@@ -445,7 +445,7 @@ def selftest(out: Path = None) -> int:
 
     def imports():
         import numpy, onnxruntime, soxr, websockets  # noqa: F401,E401
-        mods = ["core", "fakes", "vad", "update", "readiness", "micguard", "comstress"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
+        mods = ["core", "fakes", "vad", "update", "readiness", "netcheck", "micguard", "comstress"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
         for m in mods:
             importlib.import_module(f"{__package__ or 'connector'}.{m}")
         return f"version {read_version()}, {len(mods)} connector modules"
@@ -576,6 +576,8 @@ def main(argv=None) -> int:
     if not app.configured():
         with contextlib.suppress(Exception):
             webbrowser.open(f"http://127.0.0.1:{port}/")
+    from . import netcheck
+    netcheck.start(lambda: http_base(app.cfg["url"]) if app.configured() else "", busy=app.in_call)
     try:
         asyncio.run(app.run("--no-update" not in argv))
     except KeyboardInterrupt:
