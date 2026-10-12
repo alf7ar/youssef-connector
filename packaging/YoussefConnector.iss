@@ -55,7 +55,7 @@ Source: "{#SrcDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs cre
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
-Name: "{userstartup}\{#AppName}"; Filename: "{app}\{#AppExe}"
+Name: "{userstartup}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "--supervise"
 
 [Run]
 ; normal install = checkbox on the last page; silent install (auto-update) = start right away
