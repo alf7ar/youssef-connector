@@ -48,6 +48,9 @@ jobs:
       - name: Tests (core, main, update)
         run: python -m pytest -q -rP   # -rP prints the COM stress verdict (old pattern: survived or crashed)
 
+      - name: "Windows heal command-line syntax smoke (wevtutil/schtasks/pnputil/netsh/PowerShell/winrt; fails only on parse errors)"
+        run: python packaging/ci_win_smoke.py
+
       - name: "Rollback restore helper (real cmd.exe + robocopy on temp folders; old files back, start line runs, failed restore leaves state untouched)"
         run: python -m pytest -v tests/test_guard_windows.py
 
