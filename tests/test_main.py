@@ -109,3 +109,25 @@ def test_selftest_runs_clean(tmp_path):
     for step in ("imports", "crash-log", "com-init", "vad-model", "fake-audio-loop"):
         assert f"PASS {step}" in text, text
     assert "SELFTEST OK in" in text
+    assert "PASS owner-modules" in text and "PASS repair-task" in text, text
+
+
+def test_owner_modules_absent_is_reported_not_fatal(monkeypatch):
+    import importlib.util
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a, **k: None)
+    res = cm._check_owner_modules()
+    assert "heal=absent" in res and "power=absent" in res and "=ok" not in res, res
+
+
+def test_owner_modules_present_heal_must_answer_status(monkeypatch):
+    import importlib.machinery
+    import types
+    fake = types.ModuleType("connector.heal")
+    fake.__spec__ = importlib.machinery.ModuleSpec("connector.heal", None)
+    monkeypatch.setitem(sys.modules, "connector.heal", fake)
+    fake.status = lambda: {"state": "idle"}
+    assert "heal=ok" in cm._check_owner_modules()
+    fake.status = lambda: ["not", "a", "dict"]
+    with pytest.raises(AssertionError, match="heal.status"):
+        cm._check_owner_modules()
+

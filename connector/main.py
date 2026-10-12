@@ -16,6 +16,7 @@ import importlib
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -420,6 +421,27 @@ def _check_vad():
     return f"silence confidence {c:.3f}"
 
 
+OWNER_MODULES = ["heal", "bt_actions", "eventwatch", "callhealth", "repair", "phonelink", "pairing", "netcheck", "ns", "supervisor", "power"]
+
+
+def _check_owner_modules() -> str:
+    """Optional modules from the connector sprint: absent is fine, present must import (heal must also answer status())."""
+    import importlib.util
+    pkg = __package__ or "connector"
+    parts = []
+    for m in OWNER_MODULES:
+        name = f"{pkg}.{m}"
+        if importlib.util.find_spec(name) is None:
+            parts.append(f"{m}=absent")
+            continue
+        mod = importlib.import_module(name)
+        if m == "heal":
+            st = mod.status()
+            assert isinstance(st, dict), f"heal.status() returned {type(st).__name__}"
+        parts.append(f"{m}=ok")
+    return ", ".join(parts)
+
+
 SELFTEST_LIMIT_S = 55
 
 
@@ -472,6 +494,17 @@ def selftest(out: Path = None) -> int:
         from . import win_adapters, win_audio  # noqa: F401
         return "soundcard/WASAPI/pycaw import ok"
 
+    def repair_task():
+        """Informational only: never fails the selftest."""
+        if os.name != "nt":
+            return "skipped (not Windows)"
+        try:
+            p = subprocess.run(["schtasks", "/query", "/tn", "YoussefRepair"], capture_output=True, text=True, timeout=10,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as e:  # noqa: BLE001
+            return f"YoussefRepair query failed ({type(e).__name__}) (informational)"
+        return f"YoussefRepair {'present' if p.returncode == 0 else 'absent'} (informational)"
+
     def fake_loop():
         reason = asyncio.run(asyncio.wait_for(_fake_call_loop(read_version()), 40))
         assert reason == "agent_end", reason
@@ -485,6 +518,8 @@ def selftest(out: Path = None) -> int:
     step("crash-log", crash_log)
     step("com-init", com_init)
     step("audio-imports", audio_imports)
+    step("owner-modules", _check_owner_modules)
+    step("repair-task", repair_task)
     step("vad-model", _check_vad)
     step("fake-audio-loop", fake_loop)
     faulthandler.cancel_dump_traceback_later()
