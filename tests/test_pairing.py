@@ -48,7 +48,7 @@ def make(has=False, cands=(), pair_ok=True, in_call=False, logs=None, **kw):
         pairs.append(c.name)
         return {"ok": pair_ok, "status": "PAIRED" if pair_ok else "Failed"}
     p = pr.Pairer(lambda *a: (logs if logs is not None else []).append(a), has_phone=lambda: has, scan=scan, pair=pair,
-                  in_call=lambda: in_call, clock=clk, on_paired=lambda: reported.append(1), **kw)
+                  in_call=lambda: in_call, clock=clk, wall=clk, on_paired=lambda: reported.append(1), **kw)
     return p, clk, pairs, scans, reported
 
 
@@ -125,7 +125,7 @@ def test_failed_pair_backs_off_and_does_not_report():
     clk.t += pr.AFTER_ATTEMPT_S - 1
     assert p.tick() is None
     clk.t += 2
-    assert p.tick() == "failed" and len(pairs) == 2
+    assert p.tick() == "backoff" and len(pairs) == 1      # same device within the hour: not prompted again
 
 
 def test_scan_exception_is_logged_not_raised():
@@ -296,3 +296,107 @@ def test_importing_pairing_does_not_load_phone_or_winrt():
     code = "import sys; import connector.pairing; bad=[m for m in sys.modules if m=='connector.phone' or m.startswith('winrt')]; print(bad)"
     out = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=60)
     assert out.stdout.strip() == "[]", out
+
+
+# ---------------------------------------------------------------- R-c5 fixes: call re-check, scan-error gate, stranger backoff, busy()
+def test_call_starting_during_the_scan_stops_the_pairing():
+    st = {"call": False}
+    p, clk, pairs, scans, rep = make(has=True, cands=[Cand("TEST iPhone")], in_call=False)
+    real_scan = p.scan
+
+    async def scan():
+        st["call"] = True            # the hub dispatches a call while the inquiry runs
+        return await real_scan()
+    p.scan, p.in_call = scan, lambda: st["call"]
+    p.request_add_phone()
+    assert p.tick() == "in_call" and not pairs and not rep
+
+
+def test_default_has_phone_failed_scan_is_unknown_gate_closed(monkeypatch):
+    class Ph:
+        scan_info = {"ok": False, "candidates": 0}
+
+        @staticmethod
+        async def find_iphone_mac():
+            return ""
+    monkeypatch.setattr(pr, "phone", Ph)
+    with pytest.raises(RuntimeError):
+        pr._default_has_phone()
+    scans = []
+
+    async def scan():
+        scans.append(1)
+        return [Cand("TEST iPhone")]
+    p = pr.Pairer(scan=scan, clock=Clock(), on_paired=lambda: None)          # default has_phone
+    assert p.tick() == "has_phone" and not scans                              # failed scan: no pairing
+    Ph.scan_info = {"ok": True, "candidates": 0}
+    assert pr._default_has_phone() is False                                   # clean empty scan: no phone
+    monkeypatch.setattr(Ph, "find_iphone_mac", staticmethod(lambda: _coro("02:00:00:00:00:01")), raising=False)
+    assert pr._default_has_phone() is True
+
+
+async def _coro(v):
+    return v
+
+
+def test_stranger_backoff_hourly_daily_and_never_after_two_declines(tmp_path):
+    p, clk, pairs, scans, rep = make(has=False, cands=[Cand("Other iPhone")], pair_ok=False, home=tmp_path)
+    assert p.tick() == "failed"
+    clk.t += pr.BACKOFF_HOUR_S - 10
+    assert p.tick() == "backoff" and len(pairs) == 1                          # not within the hour
+    clk.t += pr.AFTER_ATTEMPT_S + 20
+    assert p.tick() == "failed" and len(pairs) == 2                           # second decline
+    for _ in range(5):                                                        # never again
+        clk.t += pr.BACKOFF_HOUR_S + 1
+        assert p.tick() == "backoff"
+    assert len(pairs) == 2
+    # persisted in HOME: a restart keeps it, and the file carries no device name
+    raw = (tmp_path / pr.BACKOFF_FILE).read_text(encoding="utf-8")
+    assert "Other" not in raw and "iPhone" not in raw
+    p2, clk2, pairs2, *_ = make(has=False, cands=[Cand("Other iPhone")], pair_ok=False, home=tmp_path)
+    clk2.t = clk.t + 10
+    assert p2.tick() == "backoff" and not pairs2
+
+
+def test_stranger_backoff_three_a_day_cap_and_per_device():
+    p, clk, pairs, scans, rep = make(has=False, cands=[Cand("TEST iPhone")], pair_ok=False)
+    p._backoff_record("TEST iPhone", "start")
+    p._backoff[p._key("TEST iPhone")]["times"] = [clk.t - 7200, clk.t - 5400, clk.t - 4000]   # 3 prompts in the last day
+    assert p._backoff_blocks("TEST iPhone") == "day" and p._backoff_blocks("Another phone") == ""
+    p._backoff[p._key("TEST iPhone")]["times"] = [clk.t - 90000, clk.t - 80000, clk.t - 4000]
+    assert p._backoff_blocks("TEST iPhone") == ""                             # older ones age out
+
+
+def test_one_prompt_per_hour_over_a_day_with_a_stranger_ignoring_it():
+    p, clk, pairs, scans, rep = make(has=False, cands=[Cand("TEST iPhone")], pair_ok=False)
+    for _ in range(24 * 60 * 30):                                             # 24 h in 2 s ticks
+        p.tick()
+        clk.t += 2.0
+    assert len(pairs) == pr.BACKOFF_MAX_DECLINES
+
+
+def test_add_phone_bypasses_backoff_and_pairing_clears_it(tmp_path):
+    p, clk, pairs, scans, rep = make(has=False, cands=[Cand("TEST iPhone")], pair_ok=False, home=tmp_path)
+    p.tick()
+    clk.t += pr.AFTER_ATTEMPT_S + 1
+    assert p.tick() == "backoff"
+    p.request_add_phone()
+    assert p.tick() == "failed" and len(pairs) == 2                           # explicit request: no backoff
+    pr_ok, clk2, pairs2, *_ = make(has=False, cands=[Cand("TEST iPhone")], pair_ok=True, home=tmp_path)
+    pr_ok._backoff = dict(p._backoff)
+    pr_ok.request_add_phone()
+    assert pr_ok.tick() == "paired" and pr_ok._backoff == {}
+
+
+def test_busy_is_true_only_while_an_attempt_runs():
+    seen = []
+    p, clk, pairs, scans, rep = make(has=False, cands=[Cand("TEST iPhone")])
+    real_pair = p.pair
+
+    async def pair(c):
+        seen.append((p.busy(), pr.busy()))
+        return await real_pair(c)
+    p.pair = pair
+    assert not p.busy() and not pr.busy()
+    assert p.tick() == "paired"
+    assert seen == [(True, True)] and not p.busy() and not pr.busy()

@@ -417,7 +417,7 @@ def auto_ready(info: dict, mac: str = "", log=_print_log) -> tuple:
         if scan.get("ok") and scan.get("candidates") == 0 and ph.get("paired") is not True:
             _heal_report("no_phone_paired")
             return False, "no_phone_paired"
-        _heal_report("iphone_not_connected", mac=mac)
+        _heal_report("iphone_not_connected")
         return False, "iphone_not_connected"
     eps = phone.hf_endpoints()
     info["hfp_audio_device"] = len(eps) == 2

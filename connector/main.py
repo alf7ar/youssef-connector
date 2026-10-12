@@ -190,7 +190,7 @@ class App:
         self.exit_for_update = False
         self.port = 0
         self.pairing_on = False    # True once the real (Windows) adapters run and the pairing thread is started
-        self.pairer = pairing.Pairer(lambda *a: self.log(*a), in_call=lambda: self.in_call())
+        self.pairer = pairing.Pairer(lambda *a: self.log(*a), in_call=lambda: self.in_call(), home=home)
 
     def configured(self) -> bool:
         return bool(self.cfg.get("url") and self.cfg.get("token"))
@@ -339,6 +339,8 @@ class App:
             phone, audio, gate, route = build_adapters(cfg=self.cfg, log=self.log)
             self.phone, self.audio_route = phone, route
             if route != "fake" and os.name == "nt":
+                busy = getattr(phone, "busy", None)   # our call or one Windows sees on the line (incoming included)
+                self.pairer.in_call = lambda: self.in_call() or bool(busy and busy())
                 self.pairer.start()
                 self.pairing_on = True
             rb = guard.rolled_back_info(self.home)

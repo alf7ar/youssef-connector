@@ -54,7 +54,7 @@ HFAG_SHORT = "0000111f"   # HandsfreeAG service class (a phone that can place ca
 PHONE_MAJOR_CLASS = 2     # Bluetooth class-of-device major class "Phone"
 # what the last find_iphone_mac scan saw: ok False = the scan failed (not "no phone"), candidates = phones found
 scan_info = {"ok": None, "candidates": None}
-_known = {"mac": "", "name": ""}   # the phone iphone()/find_iphone_mac() looked at last: used to pick its Hands-Free endpoints
+_known = {"mac": "", "name": ""}   # the phone in use (iphone() = readiness's pick, else find_iphone_mac()): picks its Hands-Free endpoints
 
 
 def _fmt_mac(address: int) -> str:
@@ -82,12 +82,22 @@ async def _is_phone(d, name: str) -> bool:
         return False
 
 
+def _remember(mac: str, name: str, connected: set):
+    """find_iphone_mac's pick becomes the phone in use only when the current one is not still connected: a scan (the pairing
+    check every 60 s, heal, the hf-check) must never move the call's Hands-Free endpoints to another phone mid-call or while
+    hf_direct has them open. iphone() (readiness's final pick) always sets it."""
+    if _known["mac"] and _known["mac"] in connected:
+        return
+    _known["mac"], _known["name"] = mac, name
+
+
 async def find_iphone_mac() -> str:
     """MAC of a paired classic-Bluetooth phone ("" if none): a device named "iPhone", of class Phone, or exposing the
     HandsfreeAG service. Several may be paired: the one that is CONNECTED now wins, else the first found. A failure is logged
     once (not swallowed); scan_info says whether the scan worked and how many candidates it saw."""
     from winrt.windows.devices.enumeration import DeviceInformation
     first, first_name, found = "", "", 0
+    connected_macs, conn_first, conn_name = set(), "", ""
     scan_info["ok"], scan_info["candidates"] = False, 0
     try:
         sel = BluetoothDevice.get_device_selector_from_pairing_state(True)
@@ -110,10 +120,12 @@ async def find_iphone_mac() -> str:
             finally:
                 d.close()
             if connected:
-                _known["mac"], _known["name"] = mac, name
-                scan_info["ok"], scan_info["candidates"] = True, found
-                return mac
-            if not first:
+                connected_macs.add(mac)
+                if not conn_first:
+                    conn_first, conn_name = mac, name
+                continue
+            # none connected: an "iPhone"-named phone ranks above a class/HFAG-only one (a paired Android)
+            if not first or ("iphone" in name.lower() and "iphone" not in first_name.lower()):
                 first, first_name = mac, name
         scan_info["ok"], scan_info["candidates"] = True, found
     except Exception as e:  # noqa: BLE001
@@ -122,8 +134,11 @@ async def find_iphone_mac() -> str:
         if _find_err[0] != msg:
             _find_err[0] = msg
             print("find_iphone_mac failed:", msg, flush=True)
+    if conn_first:   # the connected phone wins (the first connected one found)
+        _remember(conn_first, conn_name, connected_macs)
+        return conn_first
     if first:
-        _known["mac"], _known["name"] = first, first_name
+        _remember(first, first_name, connected_macs)
     return first
 
 
@@ -192,15 +207,16 @@ def endpoints() -> list:
 def hf_endpoints(mac: str = "", name: str = "") -> dict:
     """The phone's Hands-Free endpoints {"capture": {...}, "render": {...}} (state 1 = hands-free link up). Which endpoints
     belong to the phone, best match first: its Bluetooth address or name (mac/name, default the phone iphone() or
-    find_iphone_mac() saw last) in the endpoint's device text; "iphone" in it; the generic "AG Audio" (audio gateway = a
-    phone) Hands-Free name. The first tier with any endpoint is used."""
+    find_iphone_mac() saw last) in the endpoint's device text; "iphone" in it; the generic "HF Audio" Hands-Free name (the
+    phone side, which is what Windows calls a phone: "AG Audio" is a headset or car kit, never matched). The first tier with
+    any endpoint is used."""
     mac = (mac or _known["mac"]).replace(":", "").lower()
     name = (name or _known["name"]).strip().lower()
     hf = [(e, (e["device"] + " " + (e.get("iface") or "")).lower()) for e in endpoints()]
     hf = [(e, h) for e, h in hf if "hands-free" in h]
     tiers = (lambda h: bool(mac and mac in h.replace(":", "")) or bool(len(name) >= 3 and name in h),
              lambda h: "iphone" in h,
-             lambda h: "ag audio" in h)
+             lambda h: "hf audio" in h)
     out = {}
     for tier in tiers:
         for e, h in hf:
