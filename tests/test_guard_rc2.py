@@ -41,7 +41,8 @@ def test_begin_counts_starts_so_an_import_broken_build_rolls_back(tmp_path):
             break
         die(home, 1)
     assert seen == ["ok", "ok", "rollback"], seen         # the 3rd start sees two fast deaths in a row
-    assert len(spawned) == 1 and "robocopy" in " ".join(spawned[0])
+    assert len(spawned) == 1 and isinstance(spawned[0], str) and "restore.cmd" in spawned[0]
+    assert "robocopy" in (home / "restore.cmd").read_text(encoding="utf-8")
     assert guard.pinned_bad(home) == "0.1.2"
 
 
@@ -115,15 +116,26 @@ def test_heartbeat_refreshes_alive(tmp_path, monkeypatch):
     assert st["alive"] > 1000 and st["clean"] is False
 
 
-def test_restore_command_mirrors_and_checks_robocopy(tmp_path):
-    cmd = guard.restore_command(tmp_path / "home" / "previous", tmp_path / "app")[-1]
-    assert " /MIR " in cmd and "/PURGE" not in cmd
-    assert cmd.index("robocopy") < cmd.index("if errorlevel 8") < cmd.index('start ""')
-    assert "(exit /b 1)" in cmd                                  # a failed restore does not start the bad build again
-    inside = guard.restore_command(tmp_path / "app" / "previous", tmp_path / "app")[-1]
+def test_restore_script_mirrors_and_checks_robocopy(tmp_path):
+    home = tmp_path / "home"
+    sc = guard.restore_script(home, home / "previous", tmp_path / "app")
+    assert " /MIR " in sc and "/PURGE" not in sc
+    assert sc.index("robocopy") < sc.index("if errorlevel 8 goto fail") < sc.index("move /y") < sc.index('start ""') < sc.index(":fail")
+    assert sc.index("exit /b 0") < sc.index(":fail")                 # a failed restore does not start the bad build again
+    assert "\r\n" in sc and "\n" not in sc.replace("\r\n", "")
+    inside = guard.restore_script(home, tmp_path / "app" / "previous", tmp_path / "app")
     assert " /E " in inside and "/MIR" not in inside              # never purge the folder the backup lives in
+    assert "50%%" in guard.restore_script(home, home / "previous", tmp_path / "50%")   # % is doubled in a batch file
     with pytest.raises(ValueError):
-        guard.restore_command(tmp_path / 'a"b', tmp_path / "app")
+        guard.restore_script(home, tmp_path / 'a"b', tmp_path / "app")
+
+
+def test_restore_command_is_one_string_without_backslash_quotes(tmp_path):
+    home = tmp_path / "home dir (x86)"
+    cmd = guard.restore_command(home, home / "previous", tmp_path / "app")
+    assert isinstance(cmd, str) and '\\"' not in cmd                 # a str reaches Popen verbatim (no list2cmdline)
+    assert cmd == f'cmd /d /s /c ""{home / "restore.cmd"}""'
+    assert (home / "restore.cmd").read_bytes().decode("utf-8").startswith("@echo off")
 
 
 def test_entry_py_records_the_start_before_main_is_imported(tmp_path):

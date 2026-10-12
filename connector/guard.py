@@ -8,7 +8,8 @@ since (boot time changed) or the heartbeat thread saw Windows shutting down (it 
 detected with the named mutex (not with the heartbeat age), so a quick restart is counted. Two consecutive fast deaths
 of the same version restore the backup over the app dir (detached helper, after this process exits), pin the old version
 (<home>/pin.json: the bad version and anything older is never offered again) and leave <home>/rolled_back.json, which the
-restored app reports as `update_rolled_back` in its ready dict and log."""
+restored app reports as `update_rolled_back` in its ready dict and log. rolled_back.json and the reset guard.json are written by the
+helper (<home>/restore.cmd) only after robocopy succeeded."""
 import json
 import os
 import shutil
@@ -23,6 +24,8 @@ BEAT_S = 5           # guard.json `alive` refresh period
 POLL_S = 1           # how often the heartbeat thread looks at "Windows is shutting down"
 LOOP_DEATHS = 2
 BOOT_TOL_S = 120     # boot times further apart than this mean the machine restarted in between
+PENDING_ROLLED = "rolled_back.pending.json"   # staged by rollback(), moved into place by restore.cmd after a successful robocopy
+PENDING_GUARD = "guard.pending.json"
 MUTEX = "Global\\YoussefConnector"   # the single-instance mutex (main.single_instance uses this name)
 
 
@@ -126,19 +129,44 @@ def backup_current(home: Path, version: str, src: Path = None, log=print) -> boo
         return False
 
 
-def restore_command(backup: Path, target: Path, exe: str = "YoussefConnector.exe") -> list:
-    """Helper that waits for this process to exit, mirrors the backup over the app dir (/MIR: files the bad version added are
-    removed too; /E when the backup lives inside the target, so it is never purged) and starts the old exe only when
-    robocopy succeeded (its exit codes 0-7 are success, 8+ failure)."""
+def restore_script(home: Path, backup: Path, target: Path, exe: str = "YoussefConnector.exe") -> str:
+    """Text of <home>/restore.cmd: wait for this process to exit, mirror the backup over the app dir (/MIR: files the bad version
+    added are removed too; /E when the backup lives inside the target, so it is never purged), and only when robocopy succeeded
+    (exit codes 0-7; 8+ is failure) promote the staged rolled_back/guard state and start the old exe. On failure it only logs."""
     bad = '"' + "\r\n"
-    if any(c in str(p) for p in (backup, target) for c in bad):
+    if any(c in str(p) for p in (home, backup, target, exe) for c in bad):
         raise ValueError("unsafe path")
+    q = lambda p: '"' + str(p).replace("%", "%%") + '"'          # % would expand inside a batch file
     mode = "/E" if Path(backup).is_relative_to(Path(target)) else "/MIR"
-    return ["cmd", "/c", f'ping -n 4 127.0.0.1 >nul & robocopy "{backup}" "{target}" {mode} /NFL /NDL /NJH /NJS /NP >nul'
-                          f' & if errorlevel 8 (exit /b 1) else (start "" "{target}\\{exe}")']
+    lines = ["@echo off", "@chcp 65001 >nul",
+             "ping -n 4 127.0.0.1 >nul",
+             f"robocopy {q(backup)} {q(target)} {mode} /NFL /NDL /NJH /NJS /NP >nul",
+             "set RC=%errorlevel%",
+             "if errorlevel 8 goto fail",
+             f"move /y {q(home / PENDING_ROLLED)} {q(home / 'rolled_back.json')} >nul",
+             f"move /y {q(home / PENDING_GUARD)} {q(home / 'guard.json')} >nul",
+             f"start \"\" {q(Path(target) / exe)}",
+             "exit /b 0",
+             ":fail",
+             f"echo %date% %time% update_rollback_failed: robocopy exit %RC%, the app was not restored >> {q(home / 'connector.log')}",
+             "exit /b 1"]
+    return "\r\n".join(lines) + "\r\n"
 
 
-def _spawn(cmd: list):
+def restore_command(home: Path, backup: Path, target: Path, exe: str = "YoussefConnector.exe") -> str:
+    """Write <home>/restore.cmd and return the ONE command-line string that runs it: `cmd /d /s /c ""<path>""`.
+    A str (not a list) goes to Popen verbatim, so Windows list2cmdline never turns quotes into \\" (cmd.exe does not unescape
+    those, robocopy then got paths with literal quote characters). /s strips exactly the outer pair of quotes, so a home path with
+    spaces or parentheses survives (with a bare quoted path cmd would strip the quotes and split at the space). A script file (instead
+    of one long cmd string) keeps the paths out of the command line, can be read by a Linux test and holds the success-only state
+    promotion."""
+    script = Path(home) / "restore.cmd"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_bytes(restore_script(home, backup, target, exe).encode("utf-8"))
+    return f'cmd /d /s /c ""{script}""'
+
+
+def _spawn(cmd: str):
     flags = (0x00000008 | 0x00000200) if os.name == "nt" else 0
     subprocess.Popen(cmd, creationflags=flags, close_fds=True)
 
@@ -169,9 +197,11 @@ def rollback(home: Path, version: str, target: Path = None, spawn=_spawn, log=No
         prev = previous_version(home)
         log(f"update_rolled_back: {version} died within {FAST_DEATH_S}s on {LOOP_DEATHS} starts; restoring {prev}")
         _write(home / "pin.json", {"pinned": prev, "bad": version, "ts": time.time()})
-        _write(home / "rolled_back.json", {"from": version, "to": prev, "ts": time.time()})
-        _write(home / "guard.json", {"version": prev, "start": 0, "alive": 0, "clean": True, "fd": 0})
-        spawn(restore_command(home / "previous", target))
+        # staged only: restore.cmd promotes these two after robocopy succeeded, so a failed restore neither resets the death
+        # count (guard.json) nor reports a rollback that did not happen (rolled_back.json)
+        _write(home / PENDING_ROLLED, {"from": version, "to": prev, "ts": time.time()})
+        _write(home / PENDING_GUARD, {"version": prev, "start": 0, "alive": 0, "clean": True, "fd": 0})
+        spawn(restore_command(home, home / "previous", target))
         return True
     except Exception as e:  # noqa: BLE001
         log(f"guard: rollback failed: {type(e).__name__}: {e}")

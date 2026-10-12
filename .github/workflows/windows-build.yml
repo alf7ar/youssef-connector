@@ -48,6 +48,9 @@ jobs:
       - name: Tests (core, main, update)
         run: python -m pytest -q -rP   # -rP prints the COM stress verdict (old pattern: survived or crashed)
 
+      - name: "Rollback restore helper (real cmd.exe + robocopy on temp folders; old files back, start line runs, failed restore leaves state untouched)"
+        run: python -m pytest -v tests/test_guard_windows.py
+
       - name: PyInstaller build
         run: python -m PyInstaller packaging/YoussefConnector.spec --noconfirm --distpath dist --workpath build/pyi
 

@@ -1,6 +1,7 @@
 """Channels, no-update-during-call, crash-loop rollback (fakes only: local http.server, fake spawn/launch, tmp dirs)."""
 import hashlib
 import json
+import os
 import re
 import sys
 import threading
@@ -129,12 +130,55 @@ def test_two_fast_deaths_roll_back(tmp_path):
     assert guard.rollback_due(home, "0.1.2", t)
     spawned, logs = [], []
     assert guard.rollback(home, "0.1.2", target=tmp_path / "app", spawn=spawned.append, log=logs.append)
-    cmd = " ".join(spawned[0])
+    assert isinstance(spawned[0], str) and '\\"' not in spawned[0]
+    cmd = (home / "restore.cmd").read_text(encoding="utf-8")
     assert "robocopy" in cmd and str(home / "previous") in cmd and str(tmp_path / "app") in cmd
-    assert json.loads((home / "rolled_back.json").read_text())["to"] == "0.1.1"
+    assert not (home / "rolled_back.json").exists()       # written by restore.cmd after robocopy, not before
     assert logs and "update_rolled_back" in logs[0]
     assert guard.pinned_bad(home) == "0.1.2"
+    run_restore_cmd(home / "restore.cmd", robocopy_rc=1)  # robocopy "files copied" = success
+    assert json.loads((home / "rolled_back.json").read_text())["to"] == "0.1.1"
     assert not guard.rollback_due(home, "0.1.1", t)       # restored exe starts from a clean slate
+
+
+def run_restore_cmd(script, robocopy_rc):
+    """Minimal batch interpreter for the lines restore.cmd uses (Linux has no cmd.exe): robocopy exits with `robocopy_rc`."""
+    lines = [l for l in script.read_bytes().decode("utf-8").split("\r\n") if l]
+    done, i, errorlevel = [], 0, 0
+    while i < len(lines):
+        l = lines[i]
+        i += 1
+        if l.startswith("robocopy "):
+            errorlevel = robocopy_rc
+        elif l == "if errorlevel 8 goto fail" and errorlevel >= 8:
+            i = lines.index(":fail")
+        elif l.startswith("move /y "):
+            src, dst = [x for x in l.split('"') if x.strip() and x != "move /y " and not x.startswith(" >")][:2]
+            os.replace(src, dst)
+        elif l.startswith("start "):
+            done.append("start")
+        elif l.startswith("echo "):
+            done.append("log")
+        elif l.startswith("exit"):
+            break
+    return done
+
+
+def test_failed_restore_keeps_death_count_and_logs_no_rollback(tmp_path):
+    home = tmp_path / "home"
+    make_backup(home)
+    t = 1000.0
+    for _ in range(2):
+        guard.record_start(home, "0.1.2", t)
+        guard._write(home / "guard.json", {**guard._read(home / "guard.json"), "alive": t + 10})
+        t += 60
+    guard.rollback(home, "0.1.2", target=tmp_path / "app", spawn=lambda c: None, log=lambda *a: None)
+    before = guard._read(home / "guard.json")
+    assert run_restore_cmd(home / "restore.cmd", robocopy_rc=8) == ["log"]       # no start, only the failure line
+    assert guard._read(home / "guard.json") == before and before["fd"] == 1 and before["version"] == "0.1.2"
+    assert not (home / "rolled_back.json").exists() and guard.rolled_back_info(home) == {}
+    assert guard.rollback_due(home, "0.1.2", t)           # the next start tries the restore again
+    assert run_restore_cmd(home / "restore.cmd", robocopy_rc=16) == ["log"]
 
 
 def test_one_fast_death_or_long_run_or_clean_exit_does_not_roll_back(tmp_path):
