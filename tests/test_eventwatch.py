@@ -105,6 +105,20 @@ def test_wevtutil_failure_is_harmless_and_baseline_retried():
     assert w.sys_last == 5 and not [o for o in out if o[0] == "bthusb_error"]
 
 
+def test_failure_and_baseline_are_logged_once():
+    fl, out = FakeLog(), []
+    fl.fail = True
+    w = watcher(fl, out)
+    w.poll()
+    w.poll()
+    fails = [o for o in out if o[0] == "log" and "query failed" in o[1]]
+    assert len(fails) == 2 and {"System", "Application"} == {("System" if "System" in f[1] else "Application") for f in fails}
+    fl.fail = False
+    fl.add("System", 9, ev(9, "BTHUSB", 3))
+    w.poll()
+    assert any(o[0] == "log" and "watching System log from record 9" in o[1] for o in out)
+
+
 def test_application_crash_of_watched_apps_only():
     fl, out = FakeLog(), []
     w = watcher(fl, out)

@@ -92,14 +92,22 @@ def app_hit(ev):
     return None
 
 
+last_error = ""     # why the last _wevtutil call returned None (rc + start of stderr; wevtutil errors carry no secrets)
+
+
 def _wevtutil(log_name, xpath, count=QUERY_COUNT):
     """Run wevtutil (newest first); returns stdout, or None when it cannot run (not Windows, timeout, error)."""
+    global last_error
     try:
         r = subprocess.run(["wevtutil", "qe", log_name, "/q:" + xpath, "/f:xml", f"/c:{count}", "/rd:true"],
                            capture_output=True, text=True, timeout=15, encoding="utf-8", errors="replace",
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return r.stdout if r.returncode == 0 else None
-    except Exception:  # noqa: BLE001
+        if r.returncode:
+            last_error = f"rc={r.returncode} {(r.stderr or '').strip()[:100]}"
+            return None
+        return r.stdout
+    except Exception as e:  # noqa: BLE001
+        last_error = f"{type(e).__name__}: {str(e)[:100]}"
         return None
 
 
@@ -122,6 +130,7 @@ class Watcher:
         self.sys_last = None          # newest System record id seen (None = baseline not taken yet)
         self.app_last = None
         self.polls = 0
+        self._failed_logs = set()     # logs whose wevtutil failure was already logged (one line per log, not per poll)
         self.stop_event = threading.Event()
         self._thread = None
         self._lock = threading.Lock()
@@ -143,16 +152,27 @@ class Watcher:
         with self._lock:
             self.events.append(item)
 
+    def _query(self, log_name, xpath, count):
+        out = self.run(log_name, xpath, count)
+        if out is None and log_name not in self._failed_logs:
+            self._failed_logs.add(log_name)
+            self.log(f"eventwatch: wevtutil {log_name} query failed ({last_error or 'no detail'}); will keep retrying quietly")
+        elif out is not None:
+            self._failed_logs.discard(log_name)
+        return out
+
     def poll_system(self):
         if self.sys_last is None:                       # baseline: remember the newest record, replay nothing
-            out = self.run("System", "*", 1)
+            out = self._query("System", "*", 1)
             evs = parse(out) if out else []
             if evs:
                 self.sys_last = max(e["record_id"] for e in evs)
             elif out is not None and not out.strip():   # a log with no records at all
                 self.sys_last = 0
+            if self.sys_last is not None:
+                self.log(f"eventwatch: watching System log from record {self.sys_last}")
             return []
-        out = self.run("System", system_query(self.sys_last), QUERY_COUNT)
+        out = self._query("System", system_query(self.sys_last), QUERY_COUNT)
         if out is None:
             return []
         evs = sorted((e for e in parse(out) if e["record_id"] > self.sys_last), key=lambda e: e["record_id"])
@@ -171,14 +191,14 @@ class Watcher:
 
     def poll_app(self):
         first = self.app_last is None
-        out = self.run("Application", app_query(None if first else self.app_last), QUERY_COUNT)
+        out = self._query("Application", app_query(None if first else self.app_last), QUERY_COUNT)
         if out is None:
             return []
         evs = sorted((e for e in parse(out) if first or e["record_id"] > self.app_last), key=lambda e: e["record_id"])
         if evs:
             self.app_last = evs[-1]["record_id"]
         if first:                                       # from now on only newer records (the lookback above was one-off)
-            newest = parse(self.run("Application", "*", 1) or "")
+            newest = parse(self._query("Application", "*", 1) or "")
             self.app_last = max([self.app_last or 0] + [e["record_id"] for e in newest])
         hits = []
         for e in evs:
