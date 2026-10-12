@@ -1,13 +1,16 @@
 """Windows event-log watcher: spots Bluetooth driver trouble and crashes of the connector / Phone Link while the app runs.
 
 Every POLL_S seconds (daemon thread, one short `wevtutil` process per log, no admin needed, no console window):
-  * System log, records newer than the last seen record id: BTHUSB events 3/8/17/18/22, any warning or error from BTHPORT,
-    BthEnum and Microsoft-Windows-Bluetooth-*. Each new one is logged and reported to the self-healing module as
+  * System log, records newer than the last seen record id: BTHUSB events 3/8/17/18/22, any error or critical event from BTHPORT,
+    BthEnum and Microsoft-Windows-Bluetooth-* (warnings are routine out-of-range/reconnect noise: ignored). Each new one is logged and reported to the self-healing module as
     heal.report("bthusb_error", id=..., provider=...) (at most one report per provider/event id per poll).
   * Application log: Application Error / Windows Error Reporting events whose faulting app is YoussefConnector.exe or
     PhoneExperienceHost.exe. Logged and kept in status()["events"] (the heartbeat shows them under ready["heal"]["events"]).
 The first poll only records the newest System record id (old history is not replayed); the Application log is looked at
 EXTRA_LOOKBACK_S back once, because a crash usually comes just before the app was started again.
+CPU: every poll asks wevtutil for the newest QUERY_COUNT records (unfiltered, /rd:true: it stops after N records instead of
+scanning a whole log for a sparse filter) and filters by record id / provider / level here. Records are parsed one by one, so a
+single malformed record never hides the others.
 Events carry only provider, ids, level, time and the faulting app name: no message text, paths or user names."""
 import collections
 import re
@@ -28,14 +31,44 @@ WATCHED_APPS = ("youssefconnector.exe", "phoneexperiencehost.exe")
 _NS = "{http://schemas.microsoft.com/win/2004/08/events/event}"
 
 
-def _xml_events(text):
-    """wevtutil /f:xml prints bare <Event> elements one after the other; wrap them in a root. Returns the Event elements."""
-    text = re.sub(r"<\?xml[^>]*\?>", "", text or "")
+_RECORD = re.compile(r"<Event[\s>].*?</Event>", re.S)
+_BAD_CHARS = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+_CHAR_REF = re.compile(r"&#(x[0-9a-fA-F]+|[0-9]+);")
+skipped_records = 0      # records dropped as unparseable since start (the watcher logs when it grows)
+
+
+def _legal_char_ref(m):
     try:
-        root = ET.fromstring("<Events>" + text + "</Events>")
+        c = int(m.group(1)[1:], 16) if m.group(1)[0] == "x" else int(m.group(1))
+    except ValueError:
+        return ""
+    return m.group(0) if c in (9, 10, 13) or 0x20 <= c <= 0xD7FF or 0xE000 <= c <= 0xFFFD or 0x10000 <= c <= 0x10FFFF else ""
+
+
+def _one_event(rec):
+    """One '<Event ...>...</Event>' string -> Element, or None when it is not valid XML even after dropping illegal characters."""
+    try:
+        return ET.fromstring(rec)
     except ET.ParseError:
-        return []
-    return [e for e in root if e.tag in (_NS + "Event", "Event")]
+        pass
+    try:
+        return ET.fromstring(_CHAR_REF.sub(_legal_char_ref, _BAD_CHARS.sub("", rec)))
+    except ET.ParseError:
+        return None
+
+
+def _xml_events(text):
+    """wevtutil /f:xml prints bare <Event> elements one after the other: split them and parse each on its own.
+    Returns the Event elements; unparseable records are skipped (counted in skipped_records)."""
+    global skipped_records
+    out = []
+    for rec in _RECORD.findall(text or ""):
+        el = _one_event(rec)
+        if el is None:
+            skipped_records += 1
+        elif el.tag in (_NS + "Event", "Event"):
+            out.append(el)
+    return out
 
 
 def _find(el, path):
@@ -77,7 +110,7 @@ def is_bt_event(ev):
     if p == "bthusb":
         return ev["event_id"] in BTHUSB_IDS
     if p in BT_PROVIDERS or p.startswith(BT_PREFIX):
-        return ev["level"] <= 3          # critical, error, warning
+        return ev["level"] <= 2          # critical, error (warnings are routine disconnect/reconnect noise)
     return False
 
 
@@ -111,14 +144,10 @@ def _wevtutil(log_name, xpath, count=QUERY_COUNT):
         return None
 
 
-def system_query(after_id):
-    return f"*[System[EventRecordID>{int(after_id)} and (Level=1 or Level=2 or Level=3 or Provider[@Name='BTHUSB'])]]"
-
-
-def app_query(after_id=None, lookback_s=STARTUP_LOOKBACK_S):
+def app_query(lookback_s=STARTUP_LOOKBACK_S):
+    """Startup query: Application Error / WER records of the last lookback_s seconds (one-off; later polls are unfiltered)."""
     prov = "(Provider[@Name='Application Error'] or Provider[@Name='Windows Error Reporting'])"
-    cond = f"EventRecordID>{int(after_id)}" if after_id is not None else f"TimeCreated[timediff(@SystemTime)<={int(lookback_s) * 1000}]"
-    return f"*[System[{prov} and {cond}]]"
+    return f"*[System[{prov} and TimeCreated[timediff(@SystemTime)<={int(lookback_s) * 1000}]]]"
 
 
 class Watcher:
@@ -130,6 +159,8 @@ class Watcher:
         self.sys_last = None          # newest System record id seen (None = baseline not taken yet)
         self.app_last = None
         self.polls = 0
+        self._app_startup_ids = set()  # record ids already reported from the startup lookback while the baseline is still pending
+        self._skipped_logged = skipped_records
         self._failed_logs = set()     # logs whose wevtutil failure was already logged (one line per log, not per poll)
         self.stop_event = threading.Event()
         self._thread = None
@@ -161,10 +192,16 @@ class Watcher:
             self._failed_logs.discard(log_name)
         return out
 
+    def _note_skipped(self):
+        if skipped_records > self._skipped_logged:
+            self.log(f"eventwatch: skipped {skipped_records - self._skipped_logged} unparseable event record(s)")
+            self._skipped_logged = skipped_records
+
     def poll_system(self):
         if self.sys_last is None:                       # baseline: remember the newest record, replay nothing
             out = self._query("System", "*", 1)
             evs = parse(out) if out else []
+            self._note_skipped()
             if evs:
                 self.sys_last = max(e["record_id"] for e in evs)
             elif out is not None and not out.strip():   # a log with no records at all
@@ -172,10 +209,14 @@ class Watcher:
             if self.sys_last is not None:
                 self.log(f"eventwatch: watching System log from record {self.sys_last}")
             return []
-        out = self._query("System", system_query(self.sys_last), QUERY_COUNT)
+        out = self._query("System", "*", QUERY_COUNT)
         if out is None:
             return []
-        evs = sorted((e for e in parse(out) if e["record_id"] > self.sys_last), key=lambda e: e["record_id"])
+        allr = parse(out)
+        self._note_skipped()
+        if len(allr) >= QUERY_COUNT and min(e["record_id"] for e in allr) > self.sys_last + 1:
+            self.log(f"eventwatch: System log gap: more than {QUERY_COUNT} new records since record {self.sys_last}")
+        evs = sorted((e for e in allr if e["record_id"] > self.sys_last), key=lambda e: e["record_id"])
         if evs:
             self.sys_last = evs[-1]["record_id"]
         new, seen = [e for e in evs if is_bt_event(e)], set()
@@ -191,15 +232,22 @@ class Watcher:
 
     def poll_app(self):
         first = self.app_last is None
-        out = self._query("Application", app_query(None if first else self.app_last), QUERY_COUNT)
+        out = self._query("Application", app_query() if first else "*", QUERY_COUNT)
         if out is None:
             return []
-        evs = sorted((e for e in parse(out) if first or e["record_id"] > self.app_last), key=lambda e: e["record_id"])
-        if evs:
+        allr = parse(out)
+        self._note_skipped()
+        evs = sorted((e for e in allr if first or e["record_id"] > self.app_last), key=lambda e: e["record_id"])
+        if first:                                       # baseline = newest record; a failed query keeps app_last None (retried)
+            evs = [e for e in evs if e["record_id"] not in self._app_startup_ids]   # a retry repeats the lookback
+            out2 = self._query("Application", "*", 1)
+            newest = parse(out2) if out2 else []
+            if newest or (out2 is not None and not out2.strip()):    # (empty text = a log with no records at all)
+                self.app_last = max([e["record_id"] for e in evs] + [e["record_id"] for e in newest] + [0])
+            else:                                       # query failed / newest record unreadable: never baseline 0
+                self._app_startup_ids.update(e["record_id"] for e in evs)
+        elif evs:
             self.app_last = evs[-1]["record_id"]
-        if first:                                       # from now on only newer records (the lookback above was one-off)
-            newest = parse(self._query("Application", "*", 1) or "")
-            self.app_last = max([self.app_last or 0] + [e["record_id"] for e in newest])
         hits = []
         for e in evs:
             a = app_hit(e)

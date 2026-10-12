@@ -17,7 +17,7 @@ def ev(rid, provider, eid, level=2, data=(), t="2026-10-12T06:00:00.000000000Z")
 
 
 class FakeLog:
-    """Stands in for wevtutil: holds records per log, answers 'newest' (*) and the filtered queries by record id."""
+    """Stands in for wevtutil: holds records per log, returns the newest `count` records (newest first, like /rd:true)."""
     def __init__(self):
         self.recs = {"System": [], "Application": []}     # (rid, xml)
         self.calls = []
@@ -31,9 +31,6 @@ class FakeLog:
         if self.fail:
             return None
         rows = sorted(self.recs[log], reverse=True)
-        if "EventRecordID>" in xpath:
-            after = int(xpath.split("EventRecordID>")[1].split()[0].split("]")[0])
-            rows = [r for r in rows if r[0] > after]
         return "".join(x for _, x in rows[:count])
 
 
@@ -59,7 +56,10 @@ def test_is_bt_event_rules():
     mk = lambda p, i, l: {"provider": p, "event_id": i, "level": l}  # noqa: E731
     assert eventwatch.is_bt_event(mk("BTHUSB", 22, 4))                 # listed id, even at information level
     assert not eventwatch.is_bt_event(mk("BTHUSB", 5, 2))              # BTHUSB but not one of 3/8/17/18/22
-    assert eventwatch.is_bt_event(mk("BTHPORT", 1, 3)) and eventwatch.is_bt_event(mk("BthEnum", 1, 2))
+    assert eventwatch.is_bt_event(mk("BTHPORT", 1, 2)) and eventwatch.is_bt_event(mk("BthEnum", 1, 1))
+    assert not eventwatch.is_bt_event(mk("BTHPORT", 1, 3))             # warning from BTHPORT: routine reconnect noise, ignore
+    assert not eventwatch.is_bt_event(mk("BthEnum", 1, 3))
+    assert not eventwatch.is_bt_event(mk("Microsoft-Windows-Bluetooth-MTPEnum", 9, 3))
     assert not eventwatch.is_bt_event(mk("BTHPORT", 1, 4))             # information level from BTHPORT: ignore
     assert eventwatch.is_bt_event(mk("Microsoft-Windows-Bluetooth-MTPEnum", 9, 2))
     assert not eventwatch.is_bt_event(mk("Disk", 7, 2))
@@ -72,7 +72,7 @@ def test_first_poll_is_baseline_then_only_new_bt_events_reported():
     assert w.poll() == [] and w.sys_last == 100 and not [o for o in out if o[0] == "bthusb_error"]
     fl.add("System", 101, ev(101, "Disk", 7))                           # unrelated error
     fl.add("System", 102, ev(102, "BTHUSB", 18))
-    fl.add("System", 103, ev(103, "BthEnum", 5, level=3))
+    fl.add("System", 103, ev(103, "BthEnum", 5, level=2))
     new = w.poll()
     assert [e["record_id"] for e in new] == [102, 103] and w.sys_last == 103
     rep = [o for o in out if o[0] == "bthusb_error"]
@@ -176,10 +176,17 @@ def test_missing_heal_module_is_fine():
     assert len(w.poll()) == 1
 
 
-def test_queries_are_well_formed():
-    assert eventwatch.system_query(5) == "*[System[EventRecordID>5 and (Level=1 or Level=2 or Level=3 or Provider[@Name='BTHUSB'])]]"
-    q = eventwatch.app_query(9)
-    assert "EventRecordID>9" in q and "'Application Error'" in q and "'Windows Error Reporting'" in q
+def test_queries_are_well_formed_and_bounded():
+    q = eventwatch.app_query()
+    assert "timediff(@SystemTime)<=600000" in q and "'Application Error'" in q and "'Windows Error Reporting'" in q
+    fl = FakeLog()
+    w = watcher(fl, [])
+    for _ in range(3):
+        w.poll()
+    # no record-id filter (a full-log scan every poll): after the baseline every query is "*" or the one-off startup lookback
+    assert all(c[1] == "*" or "timediff" in c[1] for c in fl.calls)
+    assert all(c[2] <= eventwatch.QUERY_COUNT for c in fl.calls)
+    assert any(c[2] == eventwatch.QUERY_COUNT and c[1] == "*" for c in fl.calls if c[0] == "System")
 
 
 def test_module_start_is_noop_off_windows_and_status_default(monkeypatch):
@@ -198,3 +205,93 @@ def test_thread_loop_polls_and_stops():
         time.sleep(0.01)
     w.stop()
     assert w.polls >= 3
+
+
+def test_bad_record_in_batch_does_not_blind_the_watcher():
+    fl, out = FakeLog(), []
+    w = watcher(fl, out)
+    w.poll()
+    fl.add("System", 1, ev(1, "BTHUSB", 3))
+    fl.add("System", 2, ev(2, "Disk", 7, data=["bad &#x0; char"]))              # illegal XML character reference
+    fl.add("System", 3, ev(3, "Disk", 7, data=["raw \x01 ctrl"]))                 # literal control character
+    fl.add("System", 4, "<Event xmlns='%s'><System><oops></Event>" % NS)        # not XML at all
+    fl.add("System", 5, ev(5, "BTHUSB", 18))
+    new = w.poll()
+    assert [e["record_id"] for e in new] == [1, 5] and w.sys_last == 5          # sys_last still advances past the bad records
+    assert [o[1]["record_id"] for o in out if o[0] == "bthusb_error"] == [1, 5]
+    assert any(o[0] == "log" and "unparseable" in o[1] for o in out)            # and it says so
+    assert w.poll() == []
+
+
+def test_parse_per_record_with_bad_records_between():
+    xml = ev(1, "BTHUSB", 3) + ev(2, "Disk", 7, data=["&#x0;"]) + "<Event><System><oops></Event>" + ev(4, "BTHUSB", 8)
+    assert [e["record_id"] for e in eventwatch.parse(xml)] == [1, 2, 4]          # illegal char refs are dropped, record 3 is skipped
+
+
+def test_bad_record_in_baseline_batch_does_not_freeze_baseline():
+    fl, out = FakeLog(), []
+    fl.add("System", 100, ev(100, "BTHUSB", 3))
+    fl.add("System", 101, ev(101, "Disk", 7, data=["&#x0;"]))
+    w = watcher(fl, out)
+    w.poll()
+    assert w.sys_last is not None and w.sys_last >= 100
+    fl.add("System", 102, "<Event><System><oops></Event>")                       # newest record unreadable: baseline retried, not 0
+    w2 = watcher(fl, out)
+    w2.sys_last = None
+    w2.poll_system()
+    assert w2.sys_last is None
+    fl.add("System", 103, ev(103, "BTHUSB", 3))
+    w2.poll_system()
+    assert w2.sys_last == 103
+
+
+def test_failed_newest_record_query_keeps_app_baseline_unset_and_does_not_replay():
+    class Flaky(FakeLog):
+        def __init__(self):
+            super().__init__()
+            self.fail_newest = True
+
+        def __call__(self, log, xpath, count):
+            if log == "Application" and xpath == "*" and count == 1 and self.fail_newest:
+                self.calls.append((log, xpath, count))
+                return None
+            return super().__call__(log, xpath, count)
+    fl, out = Flaky(), []
+    for r in range(1, 31):                                                       # old history in the Application log
+        fl.add("Application", r, ev(r, "Application Error", 1000, data=["YoussefConnector.exe"]))
+    w = watcher(fl, out)
+    w.poll()
+    assert w.app_last is None                                                    # NOT 0
+    first = [e for e in w.status()["events"] if e["log"] == "Application"]
+    w.poll()
+    assert w.app_last is None
+    assert len([e for e in w.status()["events"] if e["log"] == "Application"]) == len(first)   # the retry does not duplicate them
+    fl.fail_newest = False
+    w.poll()
+    assert w.app_last == 30
+    assert len([e for e in w.status()["events"] if e["log"] == "Application"]) == len(first)
+    assert all(e["startup"] for e in w.status()["events"] if e["log"] == "Application")
+    w.poll()                                                                     # old records are never replayed as live crashes
+    assert not [e for e in w.status()["events"] if e["log"] == "Application" and not e["startup"]]
+
+
+def test_warning_level_bluetooth_events_are_ignored_but_errors_reported():
+    fl, out = FakeLog(), []
+    w = watcher(fl, out)
+    w.poll()
+    fl.add("System", 1, ev(1, "BTHPORT", 10, level=3))
+    fl.add("System", 2, ev(2, "Microsoft-Windows-Bluetooth-MTPEnum", 9, level=3))
+    fl.add("System", 3, ev(3, "BthEnum", 4, level=2))
+    new = w.poll()
+    assert [e["record_id"] for e in new] == [3] and w.sys_last == 3
+    assert [o[1]["provider"] for o in out if o[0] == "bthusb_error"] == ["BthEnum"]
+
+
+def test_system_gap_is_logged():
+    fl, out = FakeLog(), []
+    w = watcher(fl, out)
+    w.poll()
+    for r in range(1, eventwatch.QUERY_COUNT + 20):
+        fl.add("System", r, ev(r, "Disk", 7, level=4))
+    w.poll()
+    assert any(o[0] == "log" and "gap" in o[1] for o in out)

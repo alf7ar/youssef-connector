@@ -170,6 +170,21 @@ tick();setInterval(tick,2000);
 </script></body></html>"""
 
 
+def with_events(ready_fn, events_fn):
+    """Wrap a ready() callable so crash/driver events from the event-log watcher land in ready["heal"]["events"], merged into
+    whatever "heal" dict the wrapped callable already returns (the heal engine's status), whatever order the wrappers run in."""
+    def ready_with_events():
+        r = ready_fn()
+        try:
+            ev = events_fn()
+        except Exception:  # noqa: BLE001
+            ev = None
+        if ev and isinstance(r, dict):
+            r = {**r, "heal": {**(r.get("heal") if isinstance(r.get("heal"), dict) else {}), "events": ev}}
+        return r
+    return ready_with_events
+
+
 class App:
     def __init__(self, home: Path, version: str, log=print):
         self.home, self.version, self.log = home, version, log
@@ -323,16 +338,8 @@ class App:
                 ready_orig = phone.ready
                 phone.ready = lambda: {**ready_orig(), "update_rolled_back": rb}
             from . import eventwatch
-            ready_ev = phone.ready
-
-            def ready_with_events():
-                r = ready_ev()
-                ev = eventwatch.status()["events"]
-                if ev and isinstance(r, dict):
-                    r = {**r, "heal": {**(r.get("heal") if isinstance(r.get("heal"), dict) else {}), "events": ev}}
-                return r
-            phone.ready = ready_with_events
             eventwatch.start(log=lambda *a: self.log(*a))
+            phone.ready = with_events(phone.ready, lambda: eventwatch.status()["events"])   # keep this LAST: it wraps every other ready() wrapper
             self.conn = core.Connector(ws_base(self.cfg["url"]), self.cfg["token"], phone, audio, gate,
                                        audio_route=route, version=self.version, log=lambda *a: self.log(*a))
             task = asyncio.create_task(self.conn.run())
