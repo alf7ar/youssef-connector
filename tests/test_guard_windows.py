@@ -68,6 +68,7 @@ def test_restore_helper_restores_old_files_and_starts_the_old_exe(tmp_path):
     assert guard._read(home / "rolled_back.json")["to"] == "0.1.1"
     st = guard._read(home / "guard.json")
     assert st["version"] == "0.1.1" and st["clean"] is True and st["fd"] == 0
+    assert "update_rollback_restored: robocopy exit" in (home / "connector.log").read_text(errors="replace")
     assert not (home / guard.PENDING_GUARD).exists() and not (home / guard.PENDING_ROLLED).exists()
 
 
@@ -77,7 +78,9 @@ def test_failed_restore_leaves_state_untouched_and_logs(tmp_path):
     shutil.rmtree(backup)                                                    # robocopy: source missing -> exit 16
     guard._spawn(guard.restore_command(home), guard.restore_env(home, backup, target, exe="start_old.exe"))
     log = home / "connector.log"
-    assert wait_for(lambda: log.exists() and "update_rollback_failed" in log.read_text(errors="replace"))
+    assert wait_for(lambda: log.exists()), "the helper did not run"
+    text = log.read_text(errors="replace")
+    assert "update_rollback_failed: robocopy exit 16" in text, text
     assert not marker.exists()
     assert (target / "data.txt").read_text(encoding="utf-8") == "NEW"
     assert guard._read(home / "guard.json") == before and before["fd"] == 1

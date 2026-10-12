@@ -8,15 +8,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
       - name: dbg
-        shell: cmd
+        shell: pwsh
         run: |
-          mkdir "%RUNNER_TEMP%\t1\app" "%RUNNER_TEMP%\t1\home"
-          echo x> "%RUNNER_TEMP%\t1\app\a.txt"
-          robocopy "%RUNNER_TEMP%\t1\nosuch" "%RUNNER_TEMP%\t1\app" /MIR /NFL /NDL /NJH /NJS /NP >nul
-          echo robocopy-missing-source errorlevel=%errorlevel%
-          robocopy "%RUNNER_TEMP%\t1\nosuch" "%RUNNER_TEMP%\t1\app" /MIR /NFL /NDL /NJH /NJS /NP
-          echo with-output errorlevel=%errorlevel%
-          mkdir "%RUNNER_TEMP%\t1\empty"
-          robocopy "%RUNNER_TEMP%\t1\empty" "%RUNNER_TEMP%\t1\app" /MIR /NFL /NDL /NJH /NJS /NP >nul
-          echo empty-source errorlevel=%errorlevel%
+          python -m pip install pytest
+          python -m pytest -v tests/test_guard_windows.py --basetemp="$env:RUNNER_TEMP\pt"
+          $rc = $LASTEXITCODE
+          Get-ChildItem "$env:RUNNER_TEMP\pt" -Recurse -Filter connector.log | ForEach-Object { $_.FullName; Get-Content $_.FullName }
+          exit $rc

@@ -160,7 +160,7 @@ def run_restore_cmd(script, env, robocopy_rc):
         elif l.startswith("start "):
             done.append("start")
         elif l.startswith("echo "):
-            done.append("log")
+            done.append("log:" + ("failed" if "update_rollback_failed" in l else "restored"))
         elif l.startswith("exit"):
             break
     return done
@@ -178,11 +178,11 @@ def test_failed_restore_keeps_death_count_and_logs_no_rollback(tmp_path):
     guard.rollback(home, "0.1.2", target=tmp_path / "app", spawn=lambda c, e: spawned.append((c, e)), log=lambda *a: None)
     env = spawned[0][1]
     before = guard._read(home / "guard.json")
-    assert run_restore_cmd(home / "restore.cmd", env, robocopy_rc=8) == ["log"]       # no start, only the failure line
+    assert run_restore_cmd(home / "restore.cmd", env, robocopy_rc=8) == ["log:failed"]       # no start, only the failure line
     assert guard._read(home / "guard.json") == before and before["fd"] == 1 and before["version"] == "0.1.2"
     assert not (home / "rolled_back.json").exists() and guard.rolled_back_info(home) == {}
     assert guard.rollback_due(home, "0.1.2", t)           # the next start tries the restore again
-    assert run_restore_cmd(home / "restore.cmd", env, robocopy_rc=16) == ["log"]
+    assert run_restore_cmd(home / "restore.cmd", env, robocopy_rc=16) == ["log:failed"]
 
 
 def test_one_fast_death_or_long_run_or_clean_exit_does_not_roll_back(tmp_path):

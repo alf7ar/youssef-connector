@@ -132,9 +132,10 @@ def backup_current(home: Path, version: str, src: Path = None, log=print) -> boo
 RESTORE_SCRIPT = "\r\n".join([
     "@echo off",
     "ping -n 4 127.0.0.1 >nul",
-    'robocopy "%YC_BACKUP%" "%YC_TARGET%" %YC_MODE% /NFL /NDL /NJH /NJS /NP >nul',
+    'robocopy "%YC_BACKUP%" "%YC_TARGET%" %YC_MODE% /NFL /NDL /NJH /NJS /NP >nul 2>&1',      # stderr too: this runs detached, without a console
     "set RC=%errorlevel%",
     "if errorlevel 8 goto fail",
+    'echo %date% %time% update_rollback_restored: robocopy exit %RC% >> "%YC_HOME%\\connector.log"',
     f'move /y "%YC_HOME%\\{PENDING_ROLLED}" "%YC_HOME%\\rolled_back.json" >nul',
     f'move /y "%YC_HOME%\\{PENDING_GUARD}" "%YC_HOME%\\guard.json" >nul',
     'start "" "%YC_TARGET%\\%YC_EXE%"',
