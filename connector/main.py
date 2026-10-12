@@ -183,6 +183,26 @@ class App:
         self.message = ""
         self.exit_for_update = False
         self.port = 0
+        self.crash_pending = False     # set by main() when the previous run crashed: its logs go up once, on connect
+        self._crash_retry_at = 0.0
+
+    async def _send_crash_logs(self):
+        """The redacted tails of connector.log + crash.log, once after a crash, over the live control socket (never in a call)."""
+        c = self.conn
+        if not self.crash_pending or c is None or getattr(c, "_ws", None) is None or self.in_call():
+            return
+        if time.monotonic() < self._crash_retry_at:
+            return
+        try:
+            ok = await c.send_logs(logsend.collect(self.home, self.cfg))
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            self.log("crash_logs_error", f"{type(e).__name__}: {e}"[:200])
+        if ok:
+            self.crash_pending = False
+            self.log("crash_logs_sent")
+        else:
+            self._crash_retry_at = time.monotonic() + 60
 
     def configured(self) -> bool:
         return bool(self.cfg.get("url") and self.cfg.get("token"))
@@ -327,6 +347,7 @@ class App:
             task = asyncio.create_task(self.conn.run())
             while not task.done() and not self.stop_event.is_set():
                 await asyncio.sleep(0.5)
+                await self._send_crash_logs()
                 await self._update_due(check_updates)
             if self.stop_event.is_set():
                 self.conn.stop()
@@ -550,6 +571,8 @@ def enable_crash_log(home: Path):
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    # a crash of the previous run: faulthandler text in crash.log, or guard.json recorded a fast death (begin() ran already)
+    crashed = logsend.crash_pending(app_home()) or int(guard._read(app_home() / "guard.json").get("fd") or 0) > 0
     enable_crash_log(app_home())
     out = Path(argv[argv.index("--selftest-out") + 1]) if "--selftest-out" in argv else None
     if "--version" in argv:
@@ -565,6 +588,7 @@ def main(argv=None) -> int:
     log = make_logger(home)
     version = read_version()
     app = App(home, version, log)
+    app.crash_pending = crashed
     rb = guard.rolled_back_info(home)
     if rb:
         log(f"update_rolled_back: {rb.get('from')} -> {rb.get('to')} (pinned; {rb.get('from')} is not offered again)")

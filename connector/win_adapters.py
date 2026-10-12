@@ -36,6 +36,7 @@ micguard = _sibling("micguard")
 win_audio = _sibling("win_audio")
 vad = _sibling("vad")
 readiness = _sibling("readiness")
+_app_log = lambda *a, **k: None   # build(log=...) sets the app logger; never print() (lost in the frozen exe)
 
 HOME = micguard.HOME                # %LOCALAPPDATA%\YoussefConnector (YOUSSEF_HOME overrides)
 DEFAULTS_BACKUP = HOME / "default-devices.json"   # normal default devices while the cable route has them switched
@@ -79,7 +80,7 @@ def restore_defaults() -> bool:
         DEFAULTS_BACKUP.unlink()
         return True
     except Exception as e:  # noqa: BLE001
-        print(f"restore_defaults: {type(e).__name__}: {e}", flush=True)
+        _app_log(f"restore_defaults: {type(e).__name__}: {e}")
         return False
 
 
@@ -454,17 +455,22 @@ def make_adapters(route: str = "hf_direct", mac: str = "", gain: float = 1.0, lo
 def build(cfg: dict = None, log=None):
     """-> (phone, audio, gate, audio_route), what main.build_adapters expects. Optional keys of `cfg` (default: HOME/config.json):
     audio_route "hf_direct"|"cable", phone_mac, in_gain (callee microphone gain), loudness (False = no output loudness chain).
-    Restores a microphone mute / cable defaults a crashed call left behind. `log(*args)` defaults to a flushed print."""
-    if log is None:
-        def log(*a):
-            print(*a, flush=True)
+    Restores a microphone mute / cable defaults a crashed call left behind. `log(*args)` becomes the module logger for this
+    process (phone, readiness and restore_defaults write through it); without one, those messages are dropped."""
+    global _app_log
+    if log is not None:
+        _app_log = log
+    if phone is not None:
+        phone._app_log = _app_log
+    if readiness is not None:
+        readiness._app_log = _app_log
     if cfg is None:
         try:
             cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             cfg = {}
     ph, au, gate = make_adapters(cfg.get("audio_route") or "hf_direct", cfg.get("phone_mac") or "",
-                                 cfg.get("in_gain", 1.0), cfg.get("loudness", True) is not False, log)
+                                 cfg.get("in_gain", 1.0), cfg.get("loudness", True) is not False, _app_log)
     au.endpoint_volume = cfg.get("endpoint_volume", True) is not False
     au.capture_volume = cfg.get("capture_volume") if cfg.get("capture_volume") in ("log", "max") else "off"
     ph.startup_cleanup()

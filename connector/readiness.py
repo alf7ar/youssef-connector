@@ -14,6 +14,7 @@ heartbeat; a result older than PROBE_MAX_AGE counts as unknown), so they cannot 
 import asyncio
 import importlib
 import ipaddress
+import json
 import re
 import threading
 import time
@@ -300,8 +301,11 @@ _hf_thread = [None]
 _mac = [""]                                       # iPhone MAC found once (no settings file in the public connector)
 
 
+_app_log = lambda *a, **k: None   # win_adapters.build() sets the app logger (never print(): lost in the frozen exe)
+
+
 def _print_log(ev, **kw):
-    print(ev, kw, flush=True)
+    _app_log(ev, json.dumps(kw, ensure_ascii=False, default=str) if kw else "")
 
 
 def _hf_check(why: str, mac: str, log):

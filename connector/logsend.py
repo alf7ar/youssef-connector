@@ -38,6 +38,24 @@ def tail_text(path: Path, n: int = TAIL) -> str:
     return data.decode("utf-8", "replace")
 
 
+RUN_HEADER = "=== run "   # written by main.enable_crash_log at every start (crash.log is appended, never reset)
+
+
+def crash_pending(home: Path) -> bool:
+    """True when the previous run wrote anything after its own header in crash.log: faulthandler's stack of a native crash,
+    or a watchdog dump. Call it before this run writes its header; the next start then sees this run's section only, so each
+    crash is reported once."""
+    try:
+        text = (Path(home) / "crash.log").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    i = text.rfind(RUN_HEADER)
+    if i < 0:
+        return bool(text.strip())
+    nl = text.find("\n", i)
+    return bool(text[nl + 1:].strip()) if nl >= 0 else False
+
+
 def collect(home: Path, cfg: dict = None) -> str:
     """One text with a header per file: the tails of connector.log and crash.log, redacted."""
     cfg = cfg or {}

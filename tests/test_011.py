@@ -88,8 +88,11 @@ def test_find_logs_error_once(monkeypatch, capsys):
         async def find_all_async(sel):
             raise TypeError("Invalid parameter count")
     ph = load_phone(monkeypatch, DI, make_bt(DEVS))
+    lines = []
+    monkeypatch.setattr(ph, "_app_log", lambda *a, **k: lines.append(a))
     assert asyncio.run(ph.find_iphone_mac()) == "" and asyncio.run(ph.find_iphone_mac()) == ""
-    assert capsys.readouterr().out.count("find_iphone_mac failed") == 1
+    assert sum("find_iphone_mac failed" in str(a[0]) for a in lines) == 1
+    assert capsys.readouterr().out == ""      # never print(): the frozen exe has no stdout
 
 
 # ---------------------------------------------------------------- readiness re-scan

@@ -140,3 +140,48 @@ def test_ready_failed_fallback_has_arabic(tmp_path):
         return hb["ready"]
     r = asyncio.run(go())
     assert r["ok"] is False and r["reason"].startswith("ready() failed") and "الجاهزية" in r["reason_ar"] and r["reason_en"]
+
+
+def test_crash_pending_reads_only_the_previous_run_section(tmp_path):
+    hdr = "\n=== run 2026-10-12 06:00:00 pid 1 ===\n"
+    p = tmp_path / "crash.log"
+    assert logsend.crash_pending(tmp_path) is False                       # no file: first run ever
+    p.write_text(hdr, encoding="utf-8")
+    assert logsend.crash_pending(tmp_path) is False                       # header only: clean previous run
+    p.write_text(hdr + hdr, encoding="utf-8")
+    assert logsend.crash_pending(tmp_path) is False                       # two clean runs in a row
+    p.write_text(hdr + "Fatal Python error: Segmentation fault\n" + hdr, encoding="utf-8")
+    assert logsend.crash_pending(tmp_path) is False                       # the crashed run was already reported at its next start
+    p.write_text(hdr + "Fatal Python error: Segmentation fault\nFile x.py line 1\n", encoding="utf-8")
+    assert logsend.crash_pending(tmp_path) is True                        # the last run wrote a stack: report it now
+    p.write_text("no header at all, just junk\n", encoding="utf-8")
+    assert logsend.crash_pending(tmp_path) is True                        # unknown content counts as a crash
+
+
+def test_crash_logs_sent_once_on_connect_after_a_crash(tmp_path, monkeypatch):
+    monkeypatch.setenv("YC_FAKE", "1")
+    (tmp_path / "connector.log").write_text(f"earlier line token={TOKEN}\n", encoding="utf-8")
+    (tmp_path / "crash.log").write_text("\n=== run x ===\nFatal Python error: Segmentation fault\n", encoding="utf-8")
+    assert logsend.crash_pending(tmp_path) is True
+
+    async def go():
+        mh = cm._mock_hub_module()
+        hub = mh.MockHub(token=TOKEN)
+        await hub.start()
+        app = cm.App(tmp_path, "9.9.9", lambda *a: None)
+        app.crash_pending = True
+        app.cfg = {"url": hub.url, "token": TOKEN}
+        runner = asyncio.create_task(app.run(False))
+        try:
+            m = await hub.wait_msg("logs", timeout=20)                  # no POST /sendlogs: it goes up by itself
+            assert "Fatal Python error" in m["text"] and "earlier line" in m["text"] and TOKEN not in m["text"]
+            for _ in range(50):
+                if app.crash_pending is False:
+                    break
+                await asyncio.sleep(0.1)
+            assert app.crash_pending is False
+        finally:
+            app.stop_event.set()
+            await asyncio.wait_for(runner, 10)
+            await hub.stop()
+    asyncio.run(go())
