@@ -36,7 +36,8 @@ def test_command_install_and_uninstall():
         rs.command("run")
 
 
-def test_run_maps_rc_and_writes_output(tmp_path):
+def test_run_maps_rc_and_writes_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("PSModulePath", "C:\\Program Files\\PowerShell\\7\\Modules")
     seen = {}
 
     def runner(cmd, **kw):
@@ -46,6 +47,7 @@ def test_run_maps_rc_and_writes_output(tmp_path):
     assert rs.run("install", out, runner=runner) == 0
     assert "installed" in out.read_text(encoding="utf-8") and seen["capture_output"] and seen["timeout"] == rs.TIMEOUT
     assert "creationflags" in seen
+    assert not any(k.upper() == "PSMODULEPATH" for k in seen["env"]) and "PATH" in {k.upper() for k in seen["env"]}
     assert rs.run("uninstall", out, runner=lambda c, **k: R(5, "", "boom")) == 1
     assert "rc=5" in out.read_text(encoding="utf-8") and "boom" in out.read_text(encoding="utf-8")
 
