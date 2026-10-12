@@ -1,4 +1,5 @@
-"""Fakes for the connector core (tests, and the public repo's CI): FakePhone, FakeAudio, FakeGate. Stdlib + numpy only."""
+"""Fakes for the connector core (tests, and the public repo's CI): FakePhone, FakeAudio, FakeGate, FakeRadio, FakeEventLog,
+FakeSchtasks. Stdlib + numpy only."""
 import threading
 from typing import Optional
 
@@ -10,6 +11,19 @@ except ImportError:   # imported flat (dialer/ on sys.path)
     from core import AnswerGate, AudioAdapter, Clock, PhoneAdapter
 
 SCENARIOS = ("answer", "no_answer", "busy", "hangup_mid", "drop", "end_call")
+
+# Failure classes (heal contract) -> the ready() keys that go False when that failure is active.
+FAILURE_READY = {
+    "bluetooth_off": {"bt_radio": False, "iphone_connected": False, "hfp_audio_device": False},
+    "iphone_not_connected": {"iphone_connected": False, "hfp_audio_device": False},
+    "no_phone_paired": {"iphone_connected": False, "hfp_audio_device": False, "paired": False},
+    "hf_endpoints": {"hfp_audio_device": False},
+    "phone_link_not_running": {"phone_link_running": False},
+    "phone_link_not_linked": {"phone_link_linked": False},
+    "bt_unhealthy": {"hf_link": False},
+}
+FAILURE_CLASSES = ("bluetooth_off", "iphone_not_connected", "no_phone_paired", "hf_endpoints", "phone_link_not_running",
+                   "phone_link_not_linked", "bt_unhealthy", "bthusb_error", "hangup_failed", "net_dns")
 
 
 class FakePhone(PhoneAdapter):
@@ -23,6 +37,7 @@ class FakePhone(PhoneAdapter):
         self.ring_s, self.after_s, self.dial_ok = ring_s, after_s, dial_ok
         self.dialed = []
         self.hangups = 0
+        self.hangup_fails = False
         self._t_dial = None
         self._hung = False
         self.ready_dict = {"ok": True, "reason": "", "bt_radio": True, "iphone_connected": True, "hfp_audio_device": True,
@@ -30,6 +45,22 @@ class FakePhone(PhoneAdapter):
 
     def ready(self) -> dict:
         return dict(self.ready_dict)
+
+    def set_failure(self, name: str) -> None:
+        """Put the fake into the state a heal failure class describes (ready() reflects it). 'hangup_failed' makes hangup()
+        not end the call; classes with no ready() signal (bthusb_error, net_dns) leave ready() untouched."""
+        assert name in FAILURE_CLASSES, name
+        self.ready_dict.update(FAILURE_READY.get(name, {}))
+        self.ready_dict["ok"] = not FAILURE_READY.get(name)
+        if name == "hangup_failed":
+            self.hangup_fails = True
+
+    def clear_failure(self) -> None:
+        self.ready_dict.update({"ok": True, "reason": "", "bt_radio": True, "iphone_connected": True, "hfp_audio_device": True,
+                                "phone_link_running": True, "hf_link": True})
+        self.ready_dict.pop("paired", None)
+        self.ready_dict.pop("phone_link_linked", None)
+        self.hangup_fails = False
 
     def dial(self, phone: str) -> bool:
         self.dialed.append(phone)
@@ -40,7 +71,8 @@ class FakePhone(PhoneAdapter):
 
     def hangup(self) -> None:
         self.hangups += 1
-        self._hung = True
+        if not self.hangup_fails:
+            self._hung = True
 
     def call_state(self) -> str:
         if self._t_dial is None:
@@ -163,3 +195,63 @@ class FakeGate(AnswerGate):
             if self.frames_seen >= self.consume:
                 break
         return self.result
+
+
+class FakeRadio:
+    """Bluetooth radio. set(on) records toggles; `fail_on` makes the next set(True) report failure (stuck radio)."""
+    def __init__(self, on: bool = True, fail_on: bool = False):
+        self.on, self.fail_on = on, fail_on
+        self.toggles = []
+
+    def set(self, on: bool) -> bool:
+        self.toggles.append(bool(on))
+        if on and self.fail_on:
+            return False
+        self.on = bool(on)
+        return True
+
+
+class FakeEventLog:
+    """Windows event log. add() queues entries; read(source=None) returns them (newest last)."""
+    def __init__(self):
+        self.entries = []
+
+    def add(self, source: str, event_id: int, message: str = "", level: str = "error") -> None:
+        self.entries.append({"source": source, "id": event_id, "message": message, "level": level})
+
+    def read(self, source: Optional[str] = None) -> list:
+        return [dict(e) for e in self.entries if source is None or e["source"] == source]
+
+    def clear(self) -> None:
+        self.entries.clear()
+
+
+class FakeSchtasks:
+    """schtasks.exe stand-in: create/delete/run/query by task name; `fail` makes every call return rc 1."""
+    def __init__(self, fail: bool = False):
+        self.tasks, self.runs, self.calls, self.fail = {}, [], [], fail
+
+    def create(self, name: str, cmd: str, **kw) -> int:
+        self.calls.append(("create", name))
+        if self.fail:
+            return 1
+        self.tasks[name] = {"cmd": cmd, **kw}
+        return 0
+
+    def delete(self, name: str) -> int:
+        self.calls.append(("delete", name))
+        if self.fail or name not in self.tasks:
+            return 1
+        del self.tasks[name]
+        return 0
+
+    def run(self, name: str) -> int:
+        self.calls.append(("run", name))
+        if self.fail or name not in self.tasks:
+            return 1
+        self.runs.append(name)
+        return 0
+
+    def query(self, name: str) -> bool:
+        self.calls.append(("query", name))
+        return (not self.fail) and name in self.tasks
