@@ -152,14 +152,20 @@ async def _cycle() -> dict:
         return out
     was_on = _radio_is_on(r)
     out["was_on"] = was_on
-    off = await _set_radio(r, False)
-    out["steps"].append(f"off:{off}")
-    if off != "ALLOWED":
+    on = None
+    off = None
+    try:
+        off = await _set_radio(r, False)
+        out["steps"].append(f"off:{off}")
+        if off == "ALLOWED":
+            await _asleep(CYCLE_OFF_SECS)
+    finally:   # the radio must never stay off: switch it back on after an off that worked or that left it off (UNSPECIFIED can still work)
+        if off in (None, "ALLOWED") or not _radio_is_on(r):
+            on = await _set_radio(r, True)
+            out["steps"].append(f"on:{on}")
+    if on is None:   # the off request was refused and the radio is still on: nothing changed
         out["reason"] = f"access_{off.lower()}"
         return out
-    await _asleep(CYCLE_OFF_SECS)
-    on = await _set_radio(r, True)   # always switch back on, even if the radio did not report off
-    out["steps"].append(f"on:{on}")
     await _asleep(1.5)
     out["on"] = _radio_is_on(r)
     if on != "ALLOWED":
@@ -224,6 +230,11 @@ def start_hf_refresh(mac: str = "") -> dict:
         _job.update(thread=None, result=None, t0=time.monotonic(), done=done)
         t = threading.Thread(target=_worker, args=(mac, done), daemon=True, name="bt-hf-refresh")
         _job["thread"] = t
+        try:   # readiness must not start a second toggle while this one runs: it answers hf_refreshing instead
+            from connector import readiness
+            readiness._hf_thread[0] = t
+        except Exception:  # noqa: BLE001
+            pass
         t.start()
         return {"started": True, "running": True, "age": 0.0}
 

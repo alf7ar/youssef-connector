@@ -43,8 +43,14 @@ EVENT_STALE_S = 600.0    # one-shot events (event log, post-call health) stay pe
 LADDER_RESTART_S = 900.0  # s after the last action (or first report) before an exhausted ladder starts again from rung 0
 EVENT_FAILURES = ("bt_unhealthy", "bthusb_error", "hangup_failed", "net_dns")
 CAPS = {"adapter_reset": "max_adapter_resets_per_hour", "radio_on": "max_radio_toggles_per_hour",
-        "radio_cycle": "max_radio_toggles_per_hour"}
-DEFAULT_POLICY = {"radio_cycle": False, "adapter_reset": False, "max_adapter_resets_per_hour": 2, "max_radio_toggles_per_hour": 4}
+        "radio_cycle": "max_radio_toggles_per_hour", "hf_refresh": "max_hf_refresh_per_hour"}
+CAP_KEYS = tuple(dict.fromkeys(CAPS.values()))
+MAX_CAP = 1000           # policy caps are clamped to this (an infinite or huge value must never raise)
+DEFAULT_POLICY = {"radio_cycle": False, "adapter_reset": False, "max_adapter_resets_per_hour": 2, "max_radio_toggles_per_hour": 4,
+                  "max_hf_refresh_per_hour": 4}
+# tier of the contract action names: fixed here, never taken from the registrant (an unknown name keeps the caller's tier)
+TIERS = {"radio_on": "safe", "hf_refresh": "safe", "phone_connect": "safe", "phone_link_launch": "safe",
+         "radio_cycle": "heavy", "adapter_reset": "heavy"}
 RING = 20
 
 _now = time.monotonic
@@ -102,6 +108,17 @@ def set_in_call(fn):
     _in_call = fn or (lambda: False)
 
 
+def _cap_value(v):
+    """A policy cap as an int in 0..MAX_CAP (inf and huge values clamp); None when it is not a number."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if f != f:
+        return None
+    return int(min(max(f, 0.0), MAX_CAP))
+
+
 def set_policy(policy):
     """Merge the known keys of a server-pushed policy over the defaults (None / {} = defaults: heavy tiers off)."""
     global _policy
@@ -109,11 +126,10 @@ def set_policy(policy):
     for k, v in (policy or {}).items() if isinstance(policy, dict) else ():
         if k in ("radio_cycle", "adapter_reset"):
             new[k] = v is True
-        elif k in ("max_adapter_resets_per_hour", "max_radio_toggles_per_hour"):
-            try:
-                new[k] = max(0, int(v))
-            except (TypeError, ValueError):
-                pass
+        elif k in CAP_KEYS:
+            c = _cap_value(v)
+            if c is not None:
+                new[k] = c
     with _lock:
         changed = new != _policy
         _policy = new
@@ -123,7 +139,8 @@ def set_policy(policy):
 
 def register_action(name, fn, tier="safe"):
     with _lock:
-        _actions[str(name)] = (fn, "heavy" if tier == "heavy" else "safe")
+        name = str(name)
+        _actions[name] = (fn, TIERS.get(name) or ("heavy" if tier == "heavy" else "safe"))
 
 
 def _clean(detail: dict) -> dict:
@@ -158,7 +175,7 @@ def _cap_left(action, now) -> bool:
     hits = _cap_hits[key]
     while hits and now - hits[0] >= 3600.0:
         hits.popleft()
-    return len(hits) < int(_policy.get(key, 0))
+    return len(hits) < (_cap_value(_policy.get(key, 0)) or 0)
 
 
 def _skip_reason(action, now):
@@ -239,7 +256,9 @@ def tick():
                 detail = dict(f["detail"])
             else:
                 detail = {"follow_up": True}
+        _busy = True   # before the last in-call check: a dial that starts from now on sees heal busy (is_busy) and is refused
         if _in_call_now():   # a call may have started while we picked
+            _busy = False
             with _lock:
                 if key and _cap_hits[key]:
                     _cap_hits[key].pop()
@@ -248,7 +267,6 @@ def tick():
             return None
         t0 = _now()
         err = None
-        _busy = True
         try:
             r = fn()
             ok = bool(r.get("ok")) if isinstance(r, dict) else bool(r)
@@ -277,6 +295,11 @@ def tick():
         _tick_lock.release()
 
 
+def is_busy() -> bool:
+    """An action is running (or about to run) now: a dial must wait and the ready check says heal_busy."""
+    return _busy
+
+
 def status() -> dict:
     """Small JSON-safe summary for the heartbeat: actions (the last RING attempts {t: unix s, failure, action, ok, ms[, error]},
     newest last), busy (an action is running now), policy, caps (attempts in the last hour), in_call, registered, active failures."""
@@ -288,10 +311,12 @@ def status() -> dict:
             active[name] = {"next": ladder[f["rung"]] if f["rung"] < len(ladder) else None, "tried": f["rung"],
                             "count": f["count"], "age_s": int(now - f["first"])}
         caps = {}
-        for key in ("max_adapter_resets_per_hour", "max_radio_toggles_per_hour"):
+        for key in CAP_KEYS:
             caps[key[4:-9]] = sum(1 for t in _cap_hits.get(key, ()) if now - t < 3600.0)
-        return {"actions": list(_ring), "busy": _busy, "policy": dict(_policy), "caps": caps, "in_call": _in_call_now(),
-                "registered": sorted(_actions), "active": active}
+        out = {"actions": list(_ring), "busy": _busy, "policy": dict(_policy), "caps": caps,
+               "registered": sorted(_actions), "active": active}
+    out["in_call"] = _in_call_now()   # the callback runs outside the lock
+    return out
 
 
 reset_for_tests()

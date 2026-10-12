@@ -55,6 +55,7 @@ REASONS = {
                                   "No Bluetooth adapter is available on the laptop (disabled or absent). Enable it in Device Manager or plug in a dongle."),
     "iphone_not_connected": ("الآيفون مش متوصل بالبلوتوث. شغّل البلوتوث على الآيفون وقرّبه من اللابتوب.",
                              "The iPhone is not connected over Bluetooth. Turn Bluetooth on on the iPhone and bring it close."),
+    "heal_busy": ("بصلّح البلوتوث دلوقتي. استنى شوية وجرّب تاني.", "A Bluetooth repair is running. Wait a moment and try again."),
     "hf_refreshing": ("بجدد خدمة الصوت (Hands-Free) مع الآيفون. هتاخد حوالي دقيقتين.",
                       "Refreshing the iPhone Hands-Free audio service. It takes about two minutes."),
     "hf_endpoints": ("جهازي الصوت بتوع الآيفون (Hands-Free) مش ظاهرين. افصل وصّل البلوتوث.",

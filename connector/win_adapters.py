@@ -36,6 +36,7 @@ micguard = _sibling("micguard")
 win_audio = _sibling("win_audio")
 vad = _sibling("vad")
 readiness = _sibling("readiness")
+heal = _sibling("heal")
 
 HOME = micguard.HOME                # %LOCALAPPDATA%\YoussefConnector (YOUSSEF_HOME overrides)
 DEFAULTS_BACKUP = HOME / "default-devices.json"   # normal default devices while the cable route has them switched
@@ -151,6 +152,10 @@ class WinPhone(PhoneAdapter):
         num = re.sub(r"[\s\-().]", "", str(number))
         if not NUM_RE.match(num):
             self.last_error = "bad number"
+            return False
+        if heal is not None and heal.is_busy():   # a repair action (Bluetooth refresh) is running: dialing now would fail or stall it
+            self.last_error = "a Bluetooth repair is running: try again in a minute"
+            self._log("dial_refused", why="heal_busy")
             return False
         with self.lock:
             self._reset()

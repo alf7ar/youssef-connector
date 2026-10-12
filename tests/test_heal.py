@@ -265,7 +265,7 @@ def test_status_is_small_json(clk):
     st = heal.status()
     assert len(st["actions"]) == heal.RING and set(st["actions"][0]) >= {"t", "failure", "action", "ok", "ms"}
     assert isinstance(st["actions"][-1]["t"], float) and st["actions"][-1]["t"] >= st["actions"][0]["t"]   # newest last
-    assert st["busy"] is False and set(st["caps"]) == {"adapter_resets", "radio_toggles"}
+    assert st["busy"] is False and set(st["caps"]) == {"adapter_resets", "radio_toggles", "hf_refresh"}
     assert len(json.dumps(st)) < 4000
     assert st["registered"] == sorted(ALL)
 
@@ -330,9 +330,10 @@ def test_winphone_busy(monkeypatch):
     assert w.busy() is True
 
 
-def test_start_heal_thread_ticks(clk):
+def test_start_heal_thread_ticks(clk, monkeypatch):
     import threading
-    from connector import main as cm
+    from connector import bt_actions, main as cm
+    monkeypatch.setattr(bt_actions, "register", lambda h=None: None)   # the real actions would replace the test's radio_on
     heal._now = heal._wall = __import__("time").monotonic
     done = threading.Event()
     heal.register_action("radio_on", lambda: done.set() or {"ok": True})

@@ -320,7 +320,7 @@ class App:
             self.phone, self.audio_route = phone, route
             rb = guard.rolled_back_info(self.home)
             ready_orig = phone.ready
-            phone.ready = lambda: {**ready_orig(), **({"update_rolled_back": rb} if rb else {}), "heal": heal.status()}
+            phone.ready = heal_ready(ready_orig, rb)
             busy = getattr(phone, "busy", None)
             heal.set_in_call(lambda: self.in_call() or bool(busy and busy()))
             heal.set_policy(self.cfg.get("heal"))
@@ -352,10 +352,27 @@ class App:
 HEAL_EVERY = 2.0   # s between heal.tick() calls
 
 
+def heal_ready(ready_orig, rolled_back=None):
+    """The phone.ready wrapper: adds update_rolled_back and the heal status; not ready (heal_busy) while a repair action runs."""
+    def ready():
+        r = {**ready_orig(), **({"update_rolled_back": rolled_back} if rolled_back else {}), "heal": heal.status()}
+        if heal.is_busy():
+            from . import readiness
+            r.update(ok=False, reason="heal_busy")
+            readiness.decorate(r, r.get("warnings") or ())
+        return r
+    return ready
+
+
 def start_heal(app: App, log) -> threading.Thread:
     """Daemon thread: heal.tick() every HEAL_EVERY s (at most one repair action per tick, never during a call)."""
     heal.set_log(log)
     heal.set_in_call(app.in_call)
+    try:   # the Bluetooth repair actions (radio_on, hf_refresh, phone_connect, radio_cycle); without winrt they stay unregistered
+        from . import bt_actions
+        bt_actions.register(heal)
+    except Exception as e:  # noqa: BLE001
+        log("heal_register_failed", f"{type(e).__name__}: {e}"[:200])
 
     def run():
         while not app.stop_event.is_set():
