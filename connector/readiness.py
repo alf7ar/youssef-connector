@@ -30,7 +30,7 @@ def _sibling(name):
 
 
 phone = _sibling("phone")
-heal = _sibling("heal")
+heal = _sibling("heal")   # self-healing coordinator (None until that module exists)
 
 RESUME_GAP = 20.0   # s between two 0.5 s watch ticks (wall or monotonic clock) that means the laptop slept
 HF_SETTLE = 30.0    # s after app start / resume before the idle Hands-Free check (let Bluetooth reconnect first)
@@ -57,6 +57,8 @@ REASONS = {
     "iphone_not_connected": ("الآيفون مش متوصل بالبلوتوث. شغّل البلوتوث على الآيفون وقرّبه من اللابتوب.",
                              "The iPhone is not connected over Bluetooth. Turn Bluetooth on on the iPhone and bring it close."),
     "heal_busy": ("بصلّح البلوتوث دلوقتي. استنى شوية وجرّب تاني.", "A Bluetooth repair is running. Wait a moment and try again."),
+    "no_phone_paired": ("مفيش آيفون متزاوج مع اللابتوب. زاوّج الآيفون من إعدادات البلوتوث في ويندوز.",
+                        "No phone is paired with this laptop. Pair the iPhone in the Windows Bluetooth settings."),
     "hf_refreshing": ("بجدد خدمة الصوت (Hands-Free) مع الآيفون. هتاخد حوالي دقيقتين.",
                       "Refreshing the iPhone Hands-Free audio service. It takes about two minutes."),
     "hf_endpoints": ("جهازي الصوت بتوع الآيفون (Hands-Free) مش ظاهرين. افصل وصّل البلوتوث.",
@@ -353,6 +355,43 @@ def _maybe_refresh(mac: str, log) -> bool:
     return False
 
 
+def _heal_report(failure: str, **detail):
+    """Tell the self-healing coordinator about a failure (no-op when it is not there; never raises)."""
+    try:
+        if heal is not None:
+            heal.report(failure, **detail)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _pick_phone(cfg_mac: str) -> tuple:
+    """(mac, iphone() dict) of the phone to use. Candidates in order: the configured phone_mac (the preferred one), the phone
+    used last time; the first one that is connected wins. When none is connected (or none is known) a re-scan of all paired
+    phones runs (at most every RESCAN_EVERY s, always while no phone is known): a connected phone found there is adopted; a
+    disconnected one only when no phone is configured."""
+    known = [m for m in dict.fromkeys((cfg_mac, _mac[0])) if m]
+    if not known:
+        known = [m for m in (asyncio.run(phone.find_iphone_mac()),) if m]
+    mac, ph = "", {"mac": "", "name": None, "paired": False, "connected": False}   # no phone known
+    for m in known:
+        p = asyncio.run(phone.iphone(m))
+        if not mac or (p.get("connected") and not ph.get("connected")):
+            mac, ph = m, p
+        if p.get("connected"):
+            break
+    if ph.get("connected") is not True and time.monotonic() - _rescan_t[0] >= RESCAN_EVERY:
+        # no known phone is connected: another paired phone may be (at most one scan per RESCAN_EVERY s)
+        _rescan_t[0] = time.monotonic()
+        new = asyncio.run(phone.find_iphone_mac())
+        if new and new not in known:
+            p = asyncio.run(phone.iphone(new))
+            if p.get("connected") or not cfg_mac:
+                mac, ph = new, p
+    if ph.get("paired") is not False:   # never remember an address that is not paired (any more)
+        _mac[0] = mac or _mac[0]
+    return mac, ph
+
+
 def auto_ready(info: dict, mac: str = "", log=_print_log) -> tuple:
     """(ok, reason) whether the laptop can place the next call now (calls.auto_ready without the OpenAI key check and
     without the Bridge). Only an explicit negative blocks, except the call state (None = unknown, could be a live call:
@@ -379,22 +418,15 @@ def auto_ready(info: dict, mac: str = "", log=_print_log) -> tuple:
         return False, "bluetooth_adapter_missing"
     if radio.get("on") is False:
         return False, "bluetooth_off"
-    cfg_mac = mac
-    mac = mac or _mac[0] or asyncio.run(phone.find_iphone_mac())
-    _mac[0] = mac or _mac[0]
-    ph = asyncio.run(phone.iphone(mac))
+    mac, ph = _pick_phone(mac)
     info["iphone_connected"] = ph.get("connected")
     _phone_name[0] = ph.get("name") or _phone_name[0]
-    if info["iphone_connected"] is False and not cfg_mac and time.monotonic() - _rescan_t[0] >= RESCAN_EVERY:
-        # the cached phone is not connected: another paired iPhone may be (at most one scan per RESCAN_EVERY s)
-        _rescan_t[0] = time.monotonic()
-        new = asyncio.run(phone.find_iphone_mac())
-        if new and new != mac:
-            mac = _mac[0] = new
-            ph = asyncio.run(phone.iphone(mac))
-            info["iphone_connected"] = ph.get("connected")
-            _phone_name[0] = ph.get("name") or _phone_name[0]
     if info["iphone_connected"] is False:
+        scan = getattr(phone, "scan_info", None) or {}
+        if scan.get("ok") and scan.get("candidates") == 0 and ph.get("paired") is not True:
+            _heal_report("no_phone_paired")
+            return False, "no_phone_paired"
+        _heal_report("iphone_not_connected")
         return False, "iphone_not_connected"
     eps = phone.hf_endpoints()
     info["hfp_audio_device"] = len(eps) == 2

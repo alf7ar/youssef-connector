@@ -96,7 +96,7 @@ def test_find_logs_error_once(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------- readiness re-scan
-def test_rescan_throttled_and_config_mac_wins(monkeypatch):
+def test_rescan_throttled_and_config_mac_is_only_preferred(monkeypatch):
     finds = []
 
     class P:
@@ -141,8 +141,9 @@ def test_rescan_throttled_and_config_mac_wins(monkeypatch):
     assert readiness.auto_ready({}, "", lambda *a, **k: None) == (False, "iphone_not_connected")   # throttled
     assert len(finds) == 1
     readiness._rescan_t[0] = -1e9
-    assert readiness.auto_ready({}, "AA:00:00:00:00:01", lambda *a, **k: None) == (False, "iphone_not_connected")
-    assert len(finds) == 1   # explicit config mac: no re-scan
+    # configured phone_mac is only the preferred one: when it is not connected the re-scan still runs (tests/test_discovery.py)
+    assert readiness.auto_ready({}, "AA:00:00:00:00:01", lambda *a, **k: None)[0] is True
+    assert len(finds) == 2 and readiness._mac[0] == "BB:00:00:00:00:02"
 
 
 # ---------------------------------------------------------------- crash.log

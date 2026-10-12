@@ -30,7 +30,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import eventwatch, guard, heal, logsend, power, update
+from . import eventwatch, guard, heal, logsend, pairing, power, update
 
 MUTEX = guard.MUTEX
 PORT = 5076
@@ -186,19 +186,6 @@ def _heal_recent(n: int = 5):
         return None
 
 
-def _request_add_phone() -> tuple:
-    """(ok, message): opens the pairing gate when pairing.request_add() exists (P2 pairing module)."""
-    try:
-        from . import pairing
-        fn = getattr(pairing, "request_add", None)
-        if fn is None:
-            return False, "الإضافة غير متاحة الآن / Add phone not available yet"
-        fn()
-        return True, "اضغط Pair على الآيفون / Press Pair on the iPhone"
-    except Exception as e:  # noqa: BLE001
-        return False, f"فشل / failed: {type(e).__name__}"
-
-
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Youssef Connector</title><style>
 body{font-family:Segoe UI,Arial,sans-serif;max-width:560px;margin:40px auto;padding:0 16px;color:#222}
@@ -212,6 +199,7 @@ button{padding:8px 16px;margin-top:8px}.warn{color:#8a5a00}small{color:#666}</st
 <div id="status" class="card" style="display:none">
 <div>الخادم / Hub: <b id="hub"></b></div><div>الهاتف / Phone: <b id="ready"></b></div>
 <div id="warn" class="warn"></div>
+<div id="pair" class="warn" style="display:none"></div>
 <div>المكالمة / Call: <b id="call"></b></div>
 <button id="logs">إرسال السجلات / Send logs</button> <span id="logmsg"></span></div>
 <div id="phones" class="card"><div>الهواتف / Phones <small id="inuse"></small></div><div id="plist"></div>
@@ -239,6 +227,7 @@ $('hub').textContent=s.connected?'متصل / connected':'جاري الاتصال
 const r=s.ready||{};$('ready').textContent=r.ok?'جاهز / ready':'مش جاهز: '+(r.reason_ar||r.reason||'')+(r.reason_en?' / '+r.reason_en:'');
 $('ready').className=r.ok?'ok':'bad';
 $('warn').replaceChildren(...(r.warnings||[]).map(w=>{const d=document.createElement('div');d.textContent='تنبيه: '+w.ar+' / '+w.en;return d;}));
+const pg=s.pairing||{};$('pair').style.display=pg.active?'block':'none';$('pair').textContent=pg.active?(pg.message_ar+' / '+pg.message_en):'';
 $('call').textContent=s.call||'لا يوجد / none';}catch(e){}}
 $('go').onclick=async()=>{$('msg').textContent='...';const r=await fetch('/connect',{method:'POST',
 headers:{'Content-Type':'application/json'},body:JSON.stringify({code:$('code').value})});
@@ -283,6 +272,8 @@ class App:
         self._phones_lock = threading.Lock()
         self.crash_pending = False     # set by main() when the previous run crashed: its logs go up once, on connect
         self._crash_retry_at = 0.0
+        self.pairing_on = False    # True once the real (Windows) adapters run and the pairing thread is started
+        self.pairer = pairing.Pairer(lambda *a: self.log(*a), in_call=lambda: self.in_call(), home=home)
 
     async def _send_crash_logs(self):
         """The redacted tails of connector.log + crash.log, once after a crash, over the live control socket (never in a call)."""
@@ -335,7 +326,7 @@ class App:
         st = {"version": self.version, "configured": self.configured(),
                 "connected": bool(c is not None and getattr(c, "_ws", None) is not None),
                 "ready": ready, "call": (call.id if call is not None and call.reason is None else None),
-                "message": self.message}
+                "message": self.message, "pairing": self.pairer.status()}
         if c is not None and getattr(c, "token_rejected", False):
             st["state"] = "token_rejected"
             st["message"] = TOKEN_REJECTED_MSG
@@ -354,6 +345,15 @@ class App:
         except Exception:  # noqa: BLE001
             ok = False
         return (True, "تم إرسال السجلات / Logs sent") if ok else (False, "فشل الإرسال / Send failed")
+
+    def add_phone(self) -> tuple:
+        """(ok, message): open the pairing gate for a couple of minutes (status page button; a hub command can call this too)."""
+        if self.in_call():
+            return False, "فيه مكالمة شغالة، جرب بعدين / A call is in progress, try again after it ends"
+        if not self.pairing_on:
+            return False, "غير متاح / Not available on this system"
+        self.pairer.request_add_phone()
+        return True, "افتح البلوتوث على الآيفون وانتظر / Open Bluetooth on the iPhone and wait (2 min)"
 
     def in_call(self) -> bool:
         call = getattr(self.conn, "_call", None)
@@ -419,7 +419,7 @@ class App:
                     ok, msg = app.send_logs()
                     return self._send(200, json.dumps({"ok": ok, "message": msg}), "application/json")
                 if self.path == "/add-phone":
-                    ok, msg = _request_add_phone()
+                    ok, msg = app.add_phone()
                     return self._send(200, json.dumps({"ok": ok, "message": msg}), "application/json")
                 try:
                     n = min(int(self.headers.get("Content-Length") or 0), 8192)
@@ -465,6 +465,11 @@ class App:
                 continue
             phone, audio, gate, route = build_adapters(cfg=self.cfg, log=self.log)
             self.phone, self.audio_route = phone, route
+            if route != "fake" and os.name == "nt":
+                busy = getattr(phone, "busy", None)   # our call or one Windows sees on the line (incoming included)
+                self.pairer.in_call = lambda: self.in_call() or bool(busy and busy())
+                self.pairer.start()
+                self.pairing_on = True
             rb = guard.rolled_back_info(self.home)
             ready_orig = phone.ready
             phone.ready = heal_ready(ready_orig, rb)
@@ -638,7 +643,7 @@ def selftest(out: Path = None) -> int:
 
     def imports():
         import numpy, onnxruntime, soxr, websockets  # noqa: F401,E401
-        mods = ["core", "fakes", "vad", "update", "readiness", "heal", "micguard", "comstress", "supervisor", "eventwatch"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
+        mods = ["core", "fakes", "vad", "update", "readiness", "heal", "micguard", "comstress", "supervisor", "eventwatch", "pairing"] + (["phone", "win_adapters", "win_audio"] if os.name == "nt" else [])
         for m in mods:
             importlib.import_module(f"{__package__ or 'connector'}.{m}")
         return f"version {read_version()}, {len(mods)} connector modules"
